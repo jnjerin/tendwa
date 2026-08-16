@@ -24,3 +24,17 @@ export function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): EngineConfig {
   return { databaseUrl: requireEnv(env, "DATABASE_URL") };
 }
+
+export interface EmbeddingsConfig {
+  voyageApiKey: string;
+}
+
+/**
+ * Kept separate from loadConfig()/EngineConfig rather than folded in: loadConfig() is called
+ * by every DB-touching path (createPool(), migrate.ts), and requiring VOYAGE_API_KEY there
+ * would make unrelated DB operations fail to start over a missing embeddings key they never
+ * use. Validated at the point of actual use (embeddings.ts) instead.
+ */
+export function loadEmbeddingsConfig(env: NodeJS.ProcessEnv = process.env): EmbeddingsConfig {
+  return { voyageApiKey: requireEnv(env, "VOYAGE_API_KEY") };
+}

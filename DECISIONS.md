@@ -71,3 +71,11 @@ could theoretically drift out of sync with them; the transitive FK relationship 
 because experiences has no natural dedupe key and blind retries on ambiguous failures risk
 duplicate rows. Idempotency is deferred to a future request-level key at the /incidents
 endpoint.
+
+2026-08-16 — experiences intentionally has no embedding column; only knowledge is
+vector-ranked. Retrieval reaches experiences through their knowledge_evidence links (once
+reflection has run) or structured filtering (org_id, domain, recency) in the meantime, not by
+embedding and searching raw experience text directly. ENGINEERING.md §1's "embedding
+generation fails, retry separately" failure mode is a forward-looking principle for if that
+ever changes, not a commitment that this schema already embeds experiences — recorded here so
+it doesn't read as a contradiction later.
