@@ -79,3 +79,10 @@ embedding and searching raw experience text directly. ENGINEERING.md §1's "embe
 generation fails, retry separately" failure mode is a forward-looking principle for if that
 ever changes, not a commitment that this schema already embeds experiences — recorded here so
 it doesn't read as a contradiction later.
+
+2026-08-16 — embedText makes a single attempt, no bounded retry, unlike recordExperience's
+40001 retry or migrate.ts's retry-with-backoff. retrieveMemory already has a defined,
+well-tested fallback for embedding failure (degrade to experiences-only), and the Voyage
+account used in development is on a 3 RPM free tier, where an automatic retry would burn
+through the rate limit faster than it would recover from a transient failure. If embeddings
+move to a paid tier with real capacity, revisit adding one bounded retry before degrading.

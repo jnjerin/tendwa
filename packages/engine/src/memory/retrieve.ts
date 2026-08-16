@@ -83,9 +83,11 @@ function isNonEmptyString(value: unknown): value is string {
 
 /**
  * Pure validation, independent of any DB/embeddings call. Normalizes `limit` to a bounded
- * default so callers can't request an unbounded result set.
+ * default so callers can't request an unbounded result set, and trims `domain` — matching
+ * experience.ts's write-path normalization — so incidental whitespace from a client-side form
+ * field doesn't silently filter out every row instead of matching or erroring loudly.
  */
-export function validateRetrieveMemoryInput(input: RetrieveMemoryInput): { limit: number } {
+export function validateRetrieveMemoryInput(input: RetrieveMemoryInput): { limit: number; domain: string | undefined } {
   if (!isNonEmptyString(input.orgId)) {
     throw new RetrievalValidationError("orgId is required");
   }
@@ -102,7 +104,7 @@ export function validateRetrieveMemoryInput(input: RetrieveMemoryInput): { limit
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
     throw new RetrievalValidationError(`limit must be an integer between 1 and ${MAX_LIMIT}`);
   }
-  return { limit };
+  return { limit, domain: input.domain?.trim() };
 }
 
 /** CockroachDB's VECTOR literal syntax is a bracketed list, e.g. "[0.1,0.2,0.3]". */
@@ -201,8 +203,9 @@ export async function retrieveMemory(
   context: { requestId?: string } = {},
 ): Promise<RetrievalResult> {
   let limit: number;
+  let domain: string | undefined;
   try {
-    ({ limit } = validateRetrieveMemoryInput(input));
+    ({ limit, domain } = validateRetrieveMemoryInput(input));
   } catch (err) {
     log("warn", "Rejected invalid retrieval request", {
       service: "engine",
@@ -220,9 +223,21 @@ export async function retrieveMemory(
   let knowledgeUnavailable = false;
   try {
     const embedding = await embedText(input.query, { inputType: "query", requestId: context.requestId });
-    knowledge = await queryKnowledgeBySimilarity(pool, input.orgId, embedding, input.domain, limit);
+    knowledge = await queryKnowledgeBySimilarity(pool, input.orgId, embedding, domain, limit);
   } catch (err) {
     if (!(err instanceof EmbeddingError)) {
+      // A DB failure inside queryKnowledgeBySimilarity lands here too (same try block) —
+      // logged before rethrowing so a real outage is reconstructable from logs alone
+      // (ENGINEERING.md §4), same as every other propagate-on-failure path in this codebase.
+      log("error", "Knowledge retrieval failed", {
+        service: "engine",
+        component: "memory.retrieve",
+        operation: "retrieve.memory",
+        requestId: context.requestId,
+        orgId: input.orgId,
+        errorCode: "KNOWLEDGE_RETRIEVAL_FAILED",
+        err: err as Error,
+      });
       throw err;
     }
     knowledgeUnavailable = true;
@@ -237,7 +252,21 @@ export async function retrieveMemory(
     });
   }
 
-  const experiences = await queryRecentExperiences(pool, input.orgId, input.domain, limit);
+  let experiences: ExperienceMatch[];
+  try {
+    experiences = await queryRecentExperiences(pool, input.orgId, domain, limit);
+  } catch (err) {
+    log("error", "Experience retrieval failed", {
+      service: "engine",
+      component: "memory.retrieve",
+      operation: "retrieve.memory",
+      requestId: context.requestId,
+      orgId: input.orgId,
+      errorCode: "EXPERIENCE_RETRIEVAL_FAILED",
+      err: err as Error,
+    });
+    throw err;
+  }
 
   log("info", "Retrieved memory", {
     service: "engine",

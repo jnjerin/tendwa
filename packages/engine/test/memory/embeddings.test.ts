@@ -72,4 +72,29 @@ describe("embedText", () => {
 
     await expect(embedText("text", { apiKey: "test-key" })).rejects.toThrow(EmbeddingError);
   });
+
+  it("throws EmbeddingError when a shape-valid embedding contains a non-finite element", async () => {
+    const embedding = new Array(EMBEDDING_DIMENSIONS).fill(0.1);
+    embedding[500] = Number.NaN;
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: [{ embedding }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(embedText("text", { apiKey: "test-key" })).rejects.toThrow(/unexpected shape/);
+  });
+
+  it("throws EmbeddingError (not a plain Error) when VOYAGE_API_KEY is unset — fetch is never called", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const original = process.env.VOYAGE_API_KEY;
+    delete process.env.VOYAGE_API_KEY;
+
+    try {
+      // No apiKey override — forces embedText to fall through to loadEmbeddingsConfig(), which
+      // is exactly the path that used to throw a plain, unclassified Error (see DECISIONS.md).
+      await expect(embedText("text")).rejects.toThrow(EmbeddingError);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      if (original !== undefined) process.env.VOYAGE_API_KEY = original;
+    }
+  });
 });

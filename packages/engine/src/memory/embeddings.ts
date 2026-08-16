@@ -55,7 +55,17 @@ function logFailure(errorCode: string, err: unknown, requestId: string | undefin
  * "embeddings are unavailable" apart from "the database is unavailable" (ENGINEERING.md §1).
  */
 export async function embedText(text: string, options: EmbedTextOptions = {}): Promise<number[]> {
-  const apiKey = options.apiKey ?? loadEmbeddingsConfig().voyageApiKey;
+  let apiKey: string;
+  try {
+    apiKey = options.apiKey ?? loadEmbeddingsConfig().voyageApiKey;
+  } catch (err) {
+    // Config errors (e.g. VOYAGE_API_KEY unset) must classify as EmbeddingError too, not a
+    // plain Error — otherwise they'd bypass retrieveMemory's `instanceof EmbeddingError` check
+    // and hard-fail the whole retrieval instead of degrading to experiences-only, on a case
+    // that's really just another flavor of "embeddings are unavailable right now."
+    logFailure("EMBEDDING_CONFIG_MISSING", err, options.requestId);
+    throw new EmbeddingError("Voyage embeddings are not configured", { cause: err });
+  }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const controller = new AbortController();
@@ -97,9 +107,17 @@ export async function embedText(text: string, options: EmbedTextOptions = {}): P
 
   const payload = (await response.json()) as VoyageEmbeddingResponse;
   const embedding = payload.data?.[0]?.embedding;
-  if (!embedding || embedding.length !== EMBEDDING_DIMENSIONS) {
+  // Checks element type/finiteness, not just array length — a same-length array containing a
+  // stray null/string/NaN would otherwise pass this check, flow into toVectorLiteral()'s
+  // Array.join() unvalidated, and surface as an unclassified CockroachDB parse error instead
+  // of an EmbeddingError, defeating retrieveMemory's graceful-degradation path.
+  const isValidShape =
+    Array.isArray(embedding) &&
+    embedding.length === EMBEDDING_DIMENSIONS &&
+    embedding.every((value) => typeof value === "number" && Number.isFinite(value));
+  if (!isValidShape) {
     const err = new EmbeddingError(
-      `Voyage API returned an embedding of unexpected shape (expected ${EMBEDDING_DIMENSIONS} dimensions, got ${embedding?.length ?? "none"})`,
+      `Voyage API returned an embedding of unexpected shape (expected ${EMBEDDING_DIMENSIONS} finite numbers, got ${embedding?.length ?? "none"})`,
     );
     logFailure("EMBEDDING_SHAPE_INVALID", err, options.requestId);
     throw err;

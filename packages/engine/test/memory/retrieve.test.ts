@@ -24,11 +24,18 @@ const VALID_INPUT = {
 
 describe("validateRetrieveMemoryInput", () => {
   it("defaults limit to 10 when not provided", () => {
-    expect(validateRetrieveMemoryInput(VALID_INPUT)).toEqual({ limit: 10 });
+    expect(validateRetrieveMemoryInput(VALID_INPUT)).toEqual({ limit: 10, domain: undefined });
   });
 
   it("accepts an explicit limit within bounds", () => {
-    expect(validateRetrieveMemoryInput({ ...VALID_INPUT, limit: 25 })).toEqual({ limit: 25 });
+    expect(validateRetrieveMemoryInput({ ...VALID_INPUT, limit: 25 })).toEqual({ limit: 25, domain: undefined });
+  });
+
+  it("trims the domain filter, matching experience.ts's write-path normalization", () => {
+    expect(validateRetrieveMemoryInput({ ...VALID_INPUT, domain: "  incident-response  " })).toEqual({
+      limit: 10,
+      domain: "incident-response",
+    });
   });
 
   it("rejects a missing orgId", () => {
@@ -173,6 +180,16 @@ describe("retrieveMemory — graceful degradation when embeddings are unavailabl
     const pool = { query } as unknown as Pool;
 
     await expect(retrieveMemory(pool, VALID_INPUT)).rejects.toThrow("connection terminated");
+  });
+
+  it("propagates a database error from the knowledge query itself, distinct from an embedding failure", async () => {
+    embedTextMock.mockResolvedValue(new Array(1024).fill(0.01));
+    const query = vi.fn().mockRejectedValueOnce(new Error("connection terminated")); // knowledge query
+    const pool = { query } as unknown as Pool;
+
+    await expect(retrieveMemory(pool, VALID_INPUT)).rejects.toThrow("connection terminated");
+    // Only the knowledge query ran before the rejection — the experiences query never started.
+    expect((pool.query as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
   });
 
   it("rejects invalid input before calling embedText or the database at all", async () => {
