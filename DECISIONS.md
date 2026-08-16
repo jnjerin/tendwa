@@ -101,3 +101,35 @@ tests), so this is a deliberately deferred check, not an oversight. Revisit befo
 endpoint (e.g. a future POST /incidents/:id/outcome) that accepts an experienceId from outside
 its own immediately-prior recordExperience call — that's the point at which a mismatched
 org_id/experience_id pair becomes reachable, not merely theoretical.
+
+2026-08-16 — domains/incident-response imports from packages/engine via plain relative paths
+(e.g. `../../packages/engine/src/memory/experience.js`), not a `@tendwa/engine` package-name
+import. packages/engine has no public entrypoint yet — no index.ts, no package.json "exports"
+field — and deciding that surface (what to export, whether it points at src/ or a built dist/)
+is a real tooling decision of its own, not one to make implicitly as a side effect of building
+the first domain adapter. Relative imports work fine in a monorepo with everything checked out
+on disk; formalize a real package boundary (index.ts + exports) before a second domain or an
+app package needs to consume the engine the same way.
+
+2026-08-16 — domains/incident-response's seed script hardcodes every seeded outcome's status to
+'resolved' rather than exposing a `status` field on the Incident type. Every incident in
+seed-incidents.md is deliberately a resolved one (backstory for the demo); nothing in this
+dataset exercises outcomes.status's 'failed' or 'partial' values yet, so a field nobody sets is
+not worth adding. Revisit incidentToOutcome() in mapping.ts if a non-resolved incident is ever
+seeded or submitted live.
+
+2026-08-16 — The incident-response seed script classifies its target org as empty, partial, or
+complete (getSeedStatus in seed.ts) before writing, rather than a plain "do any experiences
+exist" boolean. seedIncidents() writes 11 experience+outcome pairs one at a time with no
+transaction across the pair or the loop, so a process death partway through (a timeout on
+incident #7, Ctrl-C before a demo) is a real, reachable state — code-reviewer and
+production-reviewer both independently flagged that a boolean check can't tell a fully-seeded
+org apart from a half-seeded one: re-running would either silently report "already seeded" on
+an incomplete set (false confidence right before a demo), or duplicate the incidents that had
+already landed. getSeedStatus checks both the experience count and the joined outcome count
+against the expected total (11), so it also catches the narrower case where an experience
+committed but its paired recordOutcome then failed. "partial" refuses to proceed without
+--force, rather than guessing which of skip-or-reseed the operator wants. This is still a
+single-operator, run-it-twice-by-accident safeguard, not a race-safe concurrency mechanism —
+two seed-script invocations running at the same instant against the same org are not what this
+guards against.
