@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Next.js
+.next/
+out/
+
+# Build output
+dist/
+build/
+
+# Testing
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# TypeScript
+*.tsbuildinfo
+ 
+# Local-only notes — never public
+HACKATHON_NOTES.md
