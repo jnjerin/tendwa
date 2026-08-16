@@ -86,3 +86,18 @@ well-tested fallback for embedding failure (degrade to experiences-only), and th
 account used in development is on a 3 RPM free tier, where an automatic retry would burn
 through the rate limit faster than it would recover from a transient failure. If embeddings
 move to a paid tier with real capacity, revisit adding one bounded retry before degrading.
+
+2026-08-16 — Added packages/engine/src/memory/outcome.ts (recordOutcome), mirroring
+recordExperience's validation shape, 40001-retry scope, and logging conventions exactly.
+outcomes lives in the engine, not domains/incident-response, because its columns (status,
+root_cause, action_taken, result) carry zero incident-specific meaning — the same
+domain-agnostic reasoning that already puts experiences and knowledge in the engine.
+
+2026-08-16 — recordOutcome/incidentToOutcome don't verify that experienceId's org_id actually
+matches the orgId being written with — validateNewOutcome only checks UUID shape. Nothing in
+this codebase can currently produce a mismatch (experienceId always comes from a
+recordExperience call made moments earlier with the same orgId, in both the seed script and its
+tests), so this is a deliberately deferred check, not an oversight. Revisit before building any
+endpoint (e.g. a future POST /incidents/:id/outcome) that accepts an experienceId from outside
+its own immediately-prior recordExperience call — that's the point at which a mismatched
+org_id/experience_id pair becomes reachable, not merely theoretical.
