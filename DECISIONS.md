@@ -66,3 +66,8 @@ exceptions" wording: org-scoping here is enforced transitively, via its foreign 
 knowledge(org_id) and experiences(org_id), rather than by a column on the junction table
 itself. A direct org_id column would be redundant (both referenced rows already carry it) and
 could theoretically drift out of sync with them; the transitive FK relationship can't.
+
+2026-08-16 — recordExperience retries only 40001 conflicts, not connection-level failures,
+because experiences has no natural dedupe key and blind retries on ambiguous failures risk
+duplicate rows. Idempotency is deferred to a future request-level key at the /incidents
+endpoint.
