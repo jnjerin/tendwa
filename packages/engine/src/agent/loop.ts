@@ -9,11 +9,21 @@ const MODEL = "claude-sonnet-5";
 const MAX_TOKENS = 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 2;
+// Bounds prompt input size per item (MAX_TOKENS above only bounds the *output*) — neither
+// experience.content nor knowledge.statement has a length cap on the write path, so a single
+// oversized item could otherwise inflate prompt cost/latency unboundedly. Not a full token
+// budget, but a concrete per-item ceiling; retrieveMemory's own `limit` already bounds item
+// *count*.
+const MAX_ITEM_CHARS = 2000;
 
 export class AgentReasoningError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  /** Distinct per failure category (timeout, rate limit, auth, refusal, ...) — see classifyAnthropicError. */
+  readonly code: string;
+
+  constructor(message: string, options?: { cause?: unknown; code?: string }) {
     super(message, options);
     this.name = "AgentReasoningError";
+    this.code = options?.code ?? "AGENT_REASONING_FAILED";
   }
 }
 
@@ -83,13 +93,24 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function truncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}… [truncated, ${text.length} chars total]`;
+}
+
 function formatExperience(experience: ExperienceMatch): string {
-  const metadata = experience.metadata ? ` Metadata: ${JSON.stringify(experience.metadata)}.` : "";
-  return `- [experience:${experience.id}] (occurred ${experience.occurredAt.toISOString()}) ${experience.content}${metadata}`;
+  const content = truncate(experience.content, MAX_ITEM_CHARS);
+  const metadata = experience.metadata
+    ? ` Metadata: ${truncate(JSON.stringify(experience.metadata), MAX_ITEM_CHARS)}.`
+    : "";
+  return `- [experience:${experience.id}] (occurred ${experience.occurredAt.toISOString()}) ${content}${metadata}`;
 }
 
 function formatKnowledge(knowledge: KnowledgeMatch): string {
-  return `- [knowledge:${knowledge.id}] (confidence ${knowledge.confidence.toFixed(2)}, similarity ${knowledge.similarity.toFixed(3)}) ${knowledge.statement}`;
+  const statement = truncate(knowledge.statement, MAX_ITEM_CHARS);
+  return `- [knowledge:${knowledge.id}] (confidence ${knowledge.confidence.toFixed(2)}, similarity ${knowledge.similarity.toFixed(3)}) ${statement}`;
 }
 
 /**
@@ -213,12 +234,38 @@ function getAnthropicClient(override: AnthropicMessagesClient | undefined): Anth
   try {
     anthropicApiKey = loadAgentConfig().anthropicApiKey;
   } catch (err) {
-    throw new AgentReasoningError("Anthropic API is not configured", { cause: err });
+    throw new AgentReasoningError("Anthropic API is not configured", { cause: err, code: "AGENT_CONFIG_MISSING" });
   }
   // maxRetries stated explicitly (matches the SDK default) so the bounded-retry
   // requirement in ENGINEERING.md §1 is visible in the code, not just inherited
   // silently from whatever the SDK happens to default to.
   return new Anthropic({ apiKey: anthropicApiKey, timeout: REQUEST_TIMEOUT_MS, maxRetries: MAX_RETRIES });
+}
+
+/**
+ * Classifies an Anthropic SDK error the same way embeddings.ts classifies a failed Voyage
+ * request — so an on-call engineer can filter/alert on errorCode alone (rate-limited vs.
+ * timed-out vs. misconfigured) instead of grepping free-text messages. Order matters:
+ * APIConnectionTimeoutError extends APIConnectionError, and both RateLimitError and
+ * AuthenticationError extend the generic APIError, so the more specific checks must run first.
+ */
+function classifyAnthropicError(err: unknown): string {
+  if (err instanceof Anthropic.APIConnectionTimeoutError) {
+    return "AGENT_TIMEOUT";
+  }
+  if (err instanceof Anthropic.RateLimitError) {
+    return "AGENT_RATE_LIMITED";
+  }
+  if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
+    return "AGENT_AUTH_FAILED";
+  }
+  if (err instanceof Anthropic.APIConnectionError) {
+    return "AGENT_CONNECTION_FAILED";
+  }
+  if (err instanceof Anthropic.APIError) {
+    return "AGENT_API_ERROR";
+  }
+  return "AGENT_REQUEST_FAILED";
 }
 
 /**
@@ -262,30 +309,42 @@ export async function runAgentLoop(
         },
       });
     } catch (err) {
-      throw new AgentReasoningError("Anthropic request failed", { cause: err });
+      throw new AgentReasoningError("Anthropic request failed", { cause: err, code: classifyAnthropicError(err) });
     }
 
     if (response.stop_reason === "refusal") {
       throw new AgentReasoningError(
         `Claude declined to respond (category: ${response.stop_details?.category ?? "unknown"})`,
+        { code: "AGENT_REASONING_REFUSED" },
       );
     }
     if (response.stop_reason === "max_tokens") {
-      throw new AgentReasoningError("Claude's response was truncated at max_tokens before it could be validated");
+      throw new AgentReasoningError("Claude's response was truncated at max_tokens before it could be validated", {
+        code: "AGENT_REASONING_TRUNCATED",
+      });
+    }
+    if (response.stop_reason === "model_context_window_exceeded") {
+      throw new AgentReasoningError("The retrieved context exceeded the model's context window", {
+        code: "AGENT_CONTEXT_WINDOW_EXCEEDED",
+      });
     }
 
     const textBlock = response.content.find((block): block is Anthropic.TextBlock => block.type === "text");
     if (!textBlock) {
-      throw new AgentReasoningError("Claude's response contained no text content");
+      throw new AgentReasoningError("Claude's response contained no text content", { code: "AGENT_REASONING_NO_TEXT" });
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(textBlock.text);
-    } catch (jsonErr) {
-      throw new AgentProposalValidationError(
-        `Claude returned malformed JSON: ${(jsonErr as Error).message}`,
-      );
+    } catch {
+      // Deliberately not including the parse error's message or the response text itself —
+      // V8's JSON.parse error messages embed a snippet of the offending text, which here is
+      // LLM output built from potentially sensitive retrieved experience/knowledge content;
+      // logging that snippet would violate ENGINEERING.md §4's "never log raw sensitive prompt
+      // content." The character count is enough to distinguish "empty response" from
+      // "malformed but substantial response" without echoing any of it.
+      throw new AgentProposalValidationError(`Claude returned malformed JSON (${textBlock.text.length} characters)`);
     }
 
     const proposal = validateAgentProposal(parsed, retrieval);
@@ -303,7 +362,11 @@ export async function runAgentLoop(
     return { status: "ok", retrieval, proposal };
   } catch (err) {
     const errorCode =
-      err instanceof AgentProposalValidationError ? "AGENT_PROPOSAL_VALIDATION_FAILED" : "AGENT_REASONING_FAILED";
+      err instanceof AgentProposalValidationError
+        ? "AGENT_PROPOSAL_VALIDATION_FAILED"
+        : err instanceof AgentReasoningError
+          ? err.code
+          : "AGENT_REASONING_FAILED";
     log("warn", "Agent reasoning unavailable, degrading to a retrieval-only result", {
       service: "engine",
       component: "agent.loop",

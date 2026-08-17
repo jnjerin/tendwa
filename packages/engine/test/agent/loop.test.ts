@@ -215,10 +215,46 @@ describe("runAgentLoop", () => {
     expect(result.reason).toMatch(/declined/);
   });
 
-  it("degrades to status unavailable when the response text isn't valid JSON", async () => {
+  it("degrades to status unavailable when the response is truncated at max_tokens", async () => {
     retrieveMemoryMock.mockResolvedValue(makeRetrieval());
     const createMock = vi.fn().mockResolvedValue({
-      content: [{ type: "text", text: "not json" }],
+      content: [{ type: "text", text: '{"likelyCause": "incomplet' }],
+      stop_reason: "max_tokens",
+      stop_details: null,
+    });
+
+    const result = await runAgentLoop(
+      pool,
+      { orgId: ORG_ID, query: "pool exhausted" },
+      { anthropicClient: { messages: { create: createMock } } },
+    );
+
+    expect(result.status).toBe("unavailable");
+    expect(result.reason).toMatch(/truncated/);
+  });
+
+  it("degrades to status unavailable when the context window was exceeded", async () => {
+    retrieveMemoryMock.mockResolvedValue(makeRetrieval());
+    const createMock = vi.fn().mockResolvedValue({
+      content: [],
+      stop_reason: "model_context_window_exceeded",
+      stop_details: null,
+    });
+
+    const result = await runAgentLoop(
+      pool,
+      { orgId: ORG_ID, query: "pool exhausted" },
+      { anthropicClient: { messages: { create: createMock } } },
+    );
+
+    expect(result.status).toBe("unavailable");
+    expect(result.reason).toMatch(/context window/);
+  });
+
+  it("degrades to status unavailable when the response text isn't valid JSON, without leaking the response text into the reason", async () => {
+    retrieveMemoryMock.mockResolvedValue(makeRetrieval());
+    const createMock = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "not json — a secret detail from a retrieved experience" }],
       stop_reason: "end_turn",
       stop_details: null,
     });
@@ -231,6 +267,7 @@ describe("runAgentLoop", () => {
 
     expect(result.status).toBe("unavailable");
     expect(result.reason).toMatch(/malformed JSON/);
+    expect(result.reason).not.toContain("secret detail");
   });
 
   it("degrades to status unavailable when the response cites an id that was never retrieved", async () => {
@@ -261,5 +298,23 @@ describe("runAgentLoop", () => {
       ),
     ).rejects.toThrow(RetrievalValidationError);
     expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("degrades to status unavailable when ANTHROPIC_API_KEY is unset and no client override is given", async () => {
+    retrieveMemoryMock.mockResolvedValue(makeRetrieval());
+    const original = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const result = await runAgentLoop(pool, { orgId: ORG_ID, query: "pool exhausted" });
+
+      expect(result.status).toBe("unavailable");
+      expect(result.reason).toMatch(/not configured/);
+    } finally {
+      if (original === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = original;
+      }
+    }
   });
 });

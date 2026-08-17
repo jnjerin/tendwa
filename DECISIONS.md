@@ -153,3 +153,15 @@ matches ENGINEERING.md §1's explicit "/analyze" example verbatim — "if the LL
 return the retrieved memory with a clear 'recommendation unavailable' rather than a bare 500"
 — and keeps the split consistent with retrieveMemory's own contract, which already
 distinguishes "embedding unavailable, degrade" from "DB failure, propagate" the same way.
+
+2026-08-17 — agent/loop.ts deliberately does not write to agent_audit_log, even though it
+implements the exact failure mode ENGINEERING.md §1 names ("LLM returns a malformed or invalid
+proposal: schema validation rejects it, nothing is written to the database, the rejection
+itself is recorded in agent_audit_log"). Both CLAUDE.md rule 4 and ARCHITECTURE.md's "LLM
+proposes, code validates" code sample scope the audit-log requirement to the reflection job's
+writes specifically — this file makes no database writes at all (production-reviewer confirmed
+`pool` is only ever forwarded to retrieveMemory), so there is nothing here for an audit log to
+record yet. The audit write belongs to the future `/incidents/:id/analyze` endpoint that calls
+runAgentLoop and decides what to do with the result (both `status: "ok"` proposals and
+`status: "unavailable"` rejections are "agent decisions" worth a durable record there) — noted
+explicitly here so it isn't silently dropped when that endpoint is built.

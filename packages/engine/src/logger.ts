@@ -39,6 +39,8 @@ const pinoLogger = pino({
       "*.apiKey",
       "voyageApiKey",
       "*.voyageApiKey",
+      "anthropicApiKey",
+      "*.anthropicApiKey",
       "password",
       "*.password",
       "token",
