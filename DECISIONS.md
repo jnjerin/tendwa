@@ -174,13 +174,17 @@ no embedding is invisible to queryKnowledgeBySimilarity forever, with no backfil
 anywhere in this codebase to fix it later. reflect.ts, the only caller, can just retry the
 whole operation, so failing loud here is safer than silently creating unsearchable knowledge.
 
-2026-08-17 — addEvidence (knowledge.ts) doesn't verify that knowledgeId and experienceId
-belong to the same org before linking them in knowledge_evidence. Nothing in the schema
-enforces that either — each FK points at its own table independently. This mirrors the exact
-precedent already recorded above (2026-08-16, recordOutcome/experienceId): both ids currently
-only ever come from a single validated proposal already scoped to one org's experience
-cluster, so the mismatch has no live path to happen yet. Revisit both entries together once
-reflect.ts or any future endpoint accepts these ids from outside that context.
+2026-08-17 — addEvidence (knowledge.ts) enforces that knowledgeId and experienceId belong to
+orgId with an application-level lookup before writing to knowledge_evidence, rather than
+deferring the check the way the 2026-08-16 recordOutcome/experienceId entry does. Originally
+implemented as a deferred check mirroring that precedent, but code-reviewer and
+production-reviewer both independently flagged that the analogy was weaker than it looked:
+recordOutcome at least persists its own org_id on the row it writes, so a mismatched
+experienceId is only a partial gap; knowledge_evidence has no org_id column at all (see the
+2026-08-16 entry on that), so addEvidence had zero enforcement of an orgId parameter it
+otherwise just accepted and logged. The lookup is one cheap indexed round trip, so there's no
+real cost to closing the gap now rather than deferring it — CLAUDE.md rule 5's "no exceptions"
+line is easier to honor in code than to keep re-justifying in prose.
 
 2026-08-17 — knowledge.ts's confidence decay uses a grace period (30 days) followed by daily
 multiplicative decay (1%/day), floored at a minimum of 0.05 so a knowledge item never fully
@@ -188,3 +192,24 @@ vanishes. Nothing elsewhere in this repo specifies a decay formula — ARCHITECT
 knowledge has "a decay policy" but never defines one, and DECISIONS.md had no prior entry
 either — so these are new, deliberately simple starting numbers, not a recorded requirement.
 Revisit once real usage data suggests a different grace period or rate is warranted.
+
+2026-08-17 — decayKnowledgeConfidence's UPDATE also refreshes last_reinforced_at to now() and
+is conditioned on last_reinforced_at still matching the value its own SELECT read
+(WHERE ... AND last_reinforced_at = $4), rather than a plain SET confidence = $3 WHERE org_id
+= $1 AND id = $2. Both reviewers independently found real bugs in the original read-then-write
+shape: (1) production-reviewer — without refreshing last_reinforced_at, calling this function
+twice for the same row (e.g. reflect.ts retrying after a crash) recomputed decay from the same
+staleness window both times and compounded it, so a second call wasn't a no-op the way it
+should have been; (2) code-reviewer — the SELECT and UPDATE are two separate autocommitted
+statements, not one transaction, so CockroachDB's SERIALIZABLE guarantee never covered the
+pair, and a concurrent reinforceKnowledge landing between them would have been silently
+overwritten by a decay computed from the pre-reinforcement snapshot (a lost update).
+Refreshing last_reinforced_at fixes (1) by resetting the staleness clock on every applied
+decay, the same way a genuine reinforcement would. Conditioning the UPDATE on the original
+last_reinforced_at fixes (2): a concurrent write now makes the UPDATE affect 0 rows instead of
+clobbering it, and the 0-row branch re-fetches and returns the row's current state rather than
+retrying with a stale computed value. reinforceKnowledge's own duplicate-call case (a caller
+retrying after a network timeout could double-increment reinforcement_count) is a separate,
+lower-severity, pre-existing gap — deferred for the same reason recordExperience's 40001 retry
+comment already gives for not solving idempotency at this layer: no natural dedupe key exists
+yet, and request-level idempotency keys are a future concern for whatever endpoint calls this.

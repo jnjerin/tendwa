@@ -126,15 +126,27 @@ describe("reinforceKnowledge — 40001 serialization conflict retry", () => {
 
 describe("addEvidence — 40001 serialization conflict retry", () => {
   it("retries a 40001 conflict and succeeds once it clears", async () => {
-    const { pool, query } = createMockPool(
-      (attempt) => (attempt < 2 ? makeError("restart transaction", "40001") : "ok"),
-      { knowledge_id: KNOWLEDGE_ID },
-    );
+    // The ownership-check SELECT (added after review) isn't part of the retry loop — only
+    // the INSERT that follows it is. attempt 1 here is the first INSERT attempt.
+    let ownershipChecked = false;
+    let insertAttempt = 0;
+    const query = vi.fn(async () => {
+      if (!ownershipChecked) {
+        ownershipChecked = true;
+        return { rows: [{ knowledge_org_id: ORG_ID, experience_org_id: ORG_ID }] };
+      }
+      insertAttempt += 1;
+      if (insertAttempt < 2) {
+        throw makeError("restart transaction", "40001");
+      }
+      return { rows: [{ knowledge_id: KNOWLEDGE_ID }] };
+    });
+    const pool = { query } as unknown as Pool;
 
     const result = await addEvidence(pool, { orgId: ORG_ID, knowledgeId: KNOWLEDGE_ID, experienceId: EXPERIENCE_ID });
 
     expect(result).toEqual({ added: true });
-    expect(query).toHaveBeenCalledTimes(2);
+    expect(query).toHaveBeenCalledTimes(3); // 1 ownership check + 2 INSERT attempts
   });
 });
 

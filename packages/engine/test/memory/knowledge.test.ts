@@ -133,6 +133,10 @@ describe("validateAddEvidence", () => {
     expect(() => validateAddEvidence(VALID)).not.toThrow();
   });
 
+  it("rejects an invalid orgId", () => {
+    expect(() => validateAddEvidence({ ...VALID, orgId: "not-a-uuid" })).toThrow(/orgId must be a UUID/);
+  });
+
   it("rejects an invalid knowledgeId", () => {
     expect(() => validateAddEvidence({ ...VALID, knowledgeId: "not-a-uuid" })).toThrow(/knowledgeId must be a UUID/);
   });
@@ -246,22 +250,49 @@ describe("reinforceKnowledge", () => {
 });
 
 describe("addEvidence", () => {
+  const SAME_ORG_OWNERSHIP = { rows: [{ knowledge_org_id: ORG_ID, experience_org_id: ORG_ID }] };
+
   it("adds a new evidence link", async () => {
-    const query = vi.fn().mockResolvedValue({ rows: [{ knowledge_id: KNOWLEDGE_ID }] });
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce(SAME_ORG_OWNERSHIP)
+      .mockResolvedValueOnce({ rows: [{ knowledge_id: KNOWLEDGE_ID }] });
     const pool = { query } as unknown as Pool;
 
     const result = await addEvidence(pool, { orgId: ORG_ID, knowledgeId: KNOWLEDGE_ID, experienceId: EXPERIENCE_ID });
 
     expect(result).toEqual({ added: true });
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("returns added: false when the link already existed (ON CONFLICT no-op)", async () => {
-    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const query = vi.fn().mockResolvedValueOnce(SAME_ORG_OWNERSHIP).mockResolvedValueOnce({ rows: [] });
     const pool = { query } as unknown as Pool;
 
     const result = await addEvidence(pool, { orgId: ORG_ID, knowledgeId: KNOWLEDGE_ID, experienceId: EXPERIENCE_ID });
 
     expect(result).toEqual({ added: false });
+  });
+
+  it("rejects when knowledgeId and experienceId don't both belong to orgId", async () => {
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: [{ knowledge_org_id: ORG_ID, experience_org_id: "99999999-9999-9999-9999-999999999999" }] });
+    const pool = { query } as unknown as Pool;
+
+    await expect(
+      addEvidence(pool, { orgId: ORG_ID, knowledgeId: KNOWLEDGE_ID, experienceId: EXPERIENCE_ID }),
+    ).rejects.toThrow(KnowledgeValidationError);
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects when knowledgeId doesn't exist at all", async () => {
+    const query = vi.fn().mockResolvedValueOnce({ rows: [{ knowledge_org_id: null, experience_org_id: ORG_ID }] });
+    const pool = { query } as unknown as Pool;
+
+    await expect(
+      addEvidence(pool, { orgId: ORG_ID, knowledgeId: KNOWLEDGE_ID, experienceId: EXPERIENCE_ID }),
+    ).rejects.toThrow(KnowledgeValidationError);
   });
 });
 

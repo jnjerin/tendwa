@@ -423,9 +423,12 @@ export async function reinforceKnowledge(
 /**
  * Links a knowledge row to a supporting experience. Idempotent by design (ON CONFLICT DO
  * NOTHING) — reflection may reasonably propose the same evidence link across more than one
- * run, and re-linking an existing pair is a safe no-op, not an error. Does not verify
- * knowledgeId/experienceId belong to the same org — see DECISIONS.md (mirrors the existing
- * recordOutcome/experienceId precedent).
+ * run, and re-linking an existing pair is a safe no-op, not an error.
+ *
+ * knowledge_evidence itself has no org_id column (nothing to filter the INSERT's WHERE on —
+ * see the 2026-08-16 DECISIONS.md entry), so org-scoping is enforced here instead, in code:
+ * a lookup confirms both knowledgeId and experienceId exist and belong to input.orgId before
+ * the link is written, so a caller can't cross-link knowledge and evidence across orgs.
  */
 export async function addEvidence(
   pool: Pool,
@@ -445,6 +448,28 @@ export async function addEvidence(
       err: err as Error,
     });
     throw err;
+  }
+
+  // Single-statement read, no retry — same convention as the lookup in decayKnowledgeConfidence.
+  const ownership = await pool.query<{ knowledge_org_id: string | null; experience_org_id: string | null }>(
+    `SELECT
+       (SELECT org_id FROM knowledge WHERE id = $1) AS knowledge_org_id,
+       (SELECT org_id FROM experiences WHERE id = $2) AS experience_org_id`,
+    [input.knowledgeId, input.experienceId],
+  );
+  const { knowledge_org_id: knowledgeOrgId, experience_org_id: experienceOrgId } = ownership.rows[0]!;
+  if (knowledgeOrgId !== input.orgId || experienceOrgId !== input.orgId) {
+    log("warn", "Rejected evidence link: knowledgeId/experienceId missing or not both in orgId", {
+      service: "engine",
+      component: "memory.knowledge",
+      operation: "knowledge.addEvidence",
+      requestId: context.requestId,
+      orgId: input.orgId,
+      knowledgeId: input.knowledgeId,
+      experienceId: input.experienceId,
+      errorCode: "KNOWLEDGE_EVIDENCE_ORG_MISMATCH",
+    });
+    throw new KnowledgeValidationError("knowledgeId and experienceId must both exist and belong to orgId");
   }
 
   const result = await withSerializationRetry(
@@ -493,6 +518,22 @@ export async function addEvidence(
  * decaying or when to run — that selection/scheduling is reflect.ts's job; this only
  * evaluates and (if applicable) writes one row's own state, matching the "no orchestration"
  * scope for this whole file.
+ *
+ * The UPDATE also refreshes last_reinforced_at to now(), and is conditioned on
+ * last_reinforced_at still matching the value this call read (optimistic concurrency) — both
+ * exist to close two related bugs review found in the read-then-write shape:
+ *   - Idempotency: without refreshing last_reinforced_at, calling this twice in a row (e.g. a
+ *     crash-recovery retry from reflect.ts) would recompute decay from the same staleness
+ *     window both times and compound it — the second call re-decays an already-decayed value
+ *     instead of being a no-op. Refreshing it resets the staleness clock, exactly like a
+ *     genuine reinforcement would, so a prompt repeat call correctly lands back inside the
+ *     grace period.
+ *   - Lost update: the SELECT and UPDATE are two separate autocommitted statements, not one
+ *     transaction, so CockroachDB's SERIALIZABLE guarantee doesn't cover the pair — a
+ *     concurrent reinforceKnowledge landing in between would otherwise be silently overwritten
+ *     by a decay computed from the pre-reinforcement snapshot. The WHERE ... AND
+ *     last_reinforced_at = $4 guard makes the UPDATE affect 0 rows instead of overwriting it;
+ *     see the 0-rows branch below for what happens then.
  */
 export async function decayKnowledgeConfidence(
   pool: Pool,
@@ -554,10 +595,10 @@ export async function decayKnowledgeConfidence(
     () =>
       pool.query<KnowledgeRow>(
         `UPDATE knowledge
-         SET confidence = $3
-         WHERE org_id = $1 AND id = $2
+         SET confidence = $3, last_reinforced_at = now()
+         WHERE org_id = $1 AND id = $2 AND last_reinforced_at = $4
          RETURNING id, org_id, domain, statement, confidence, reinforcement_count, last_reinforced_at, created_at`,
-        [input.orgId, input.knowledgeId, decayedConfidence],
+        [input.orgId, input.knowledgeId, decayedConfidence, currentRow.last_reinforced_at],
       ),
     (attempt, err, retrying) => {
       const conflict = isSerializationConflict(err);
@@ -581,9 +622,39 @@ export async function decayKnowledgeConfidence(
 
   const updatedRow = updated.rows[0];
   if (!updatedRow) {
-    // The row existed moments ago (the SELECT above) but is gone by the time the UPDATE
-    // landed — a genuine concurrent-delete race, not something client-side retry fixes.
-    throw new KnowledgeNotFoundError(`No knowledge found for org ${input.orgId} with id ${input.knowledgeId}`);
+    // 0 rows means either the row was deleted, or last_reinforced_at moved since the SELECT
+    // above (a concurrent reinforceKnowledge or another decay call) — re-check which. A
+    // concurrent write supersedes this decay computation, so return its current state rather
+    // than retrying with a now-stale decayedConfidence.
+    const recheck = await pool.query<KnowledgeRow>(
+      `SELECT id, org_id, domain, statement, confidence, reinforcement_count, last_reinforced_at, created_at
+       FROM knowledge
+       WHERE org_id = $1 AND id = $2`,
+      [input.orgId, input.knowledgeId],
+    );
+    const recheckRow = recheck.rows[0];
+    if (!recheckRow) {
+      log("warn", "Decay target no longer exists (deleted concurrently)", {
+        service: "engine",
+        component: "memory.knowledge",
+        operation: "knowledge.decay",
+        requestId: context.requestId,
+        orgId: input.orgId,
+        knowledgeId: input.knowledgeId,
+        errorCode: "KNOWLEDGE_NOT_FOUND",
+      });
+      throw new KnowledgeNotFoundError(`No knowledge found for org ${input.orgId} with id ${input.knowledgeId}`);
+    }
+    log("info", "Knowledge was reinforced or decayed concurrently; returning its current state instead of overwriting it with a stale decay", {
+      service: "engine",
+      component: "memory.knowledge",
+      operation: "knowledge.decay",
+      requestId: context.requestId,
+      orgId: input.orgId,
+      knowledgeId: input.knowledgeId,
+      confidence: recheckRow.confidence,
+    });
+    return mapRow(recheckRow);
   }
   const knowledge = mapRow(updatedRow);
   log("info", "Applied confidence decay", {
