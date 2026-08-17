@@ -38,3 +38,16 @@ export interface EmbeddingsConfig {
 export function loadEmbeddingsConfig(env: NodeJS.ProcessEnv = process.env): EmbeddingsConfig {
   return { voyageApiKey: requireEnv(env, "VOYAGE_API_KEY") };
 }
+
+export interface AgentConfig {
+  anthropicApiKey: string;
+}
+
+/**
+ * Kept separate from loadConfig()/EngineConfig for the same reason as
+ * loadEmbeddingsConfig() — validated at the point of use (agent/loop.ts) so a
+ * missing ANTHROPIC_API_KEY doesn't fail unrelated DB-only paths that never call Claude.
+ */
+export function loadAgentConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
+  return { anthropicApiKey: requireEnv(env, "ANTHROPIC_API_KEY") };
+}

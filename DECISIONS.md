@@ -133,3 +133,23 @@ committed but its paired recordOutcome then failed. "partial" refuses to proceed
 single-operator, run-it-twice-by-accident safeguard, not a race-safe concurrency mechanism —
 two seed-script invocations running at the same instant against the same org are not what this
 guards against.
+
+2026-08-17 — agent/loop.ts's Claude response uses a static JSON Schema
+(`output_config.format`) instead of zod or a per-request dynamic enum of valid
+experience/knowledge ids. No other module in the codebase uses zod, and validation stays
+hand-rolled everywhere on purpose (see the ExperienceValidationError/RetrievalValidationError
+pattern) — adding zod for one call site would break that consistency. A dynamic enum was
+considered (constrain `citedExperienceIds`/`citedKnowledgeIds` to only the ids actually
+retrieved, at the schema level) and rejected: JSON Schema still can't express the
+knowledgeUnavailable-implies-empty-citedKnowledgeIds rule or the confidence range, so code has
+to validate those regardless — a dynamic schema would add real complexity (a new schema, and
+therefore no compilation-cache benefit, on every request) for a check that isn't actually
+removed, just partially duplicated.
+
+2026-08-17 — agent/loop.ts's reasoning/validation failures degrade to `status: "unavailable"`
+(with the retrieval still attached) rather than throwing, but retrieval failures
+(RetrievalValidationError, a DB error from retrieveMemory) are left to propagate uncaught. This
+matches ENGINEERING.md §1's explicit "/analyze" example verbatim — "if the LLM call fails,
+return the retrieved memory with a clear 'recommendation unavailable' rather than a bare 500"
+— and keeps the split consistent with retrieveMemory's own contract, which already
+distinguishes "embedding unavailable, degrade" from "DB failure, propagate" the same way.
