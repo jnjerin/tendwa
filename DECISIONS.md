@@ -165,3 +165,26 @@ record yet. The audit write belongs to the future `/incidents/:id/analyze` endpo
 runAgentLoop and decides what to do with the result (both `status: "ok"` proposals and
 `status: "unavailable"` rejections are "agent decisions" worth a durable record there) — noted
 explicitly here so it isn't silently dropped when that endpoint is built.
+
+2026-08-17 — createKnowledge (knowledge.ts) fails the whole write if embedding the statement
+fails, rather than degrading to a row with a NULL embedding (the column is nullable, so that
+path is technically available). This is the opposite default from retrieveMemory's
+degrade-on-embedding-failure: a read must respond with *something*, but a knowledge row with
+no embedding is invisible to queryKnowledgeBySimilarity forever, with no backfill mechanism
+anywhere in this codebase to fix it later. reflect.ts, the only caller, can just retry the
+whole operation, so failing loud here is safer than silently creating unsearchable knowledge.
+
+2026-08-17 — addEvidence (knowledge.ts) doesn't verify that knowledgeId and experienceId
+belong to the same org before linking them in knowledge_evidence. Nothing in the schema
+enforces that either — each FK points at its own table independently. This mirrors the exact
+precedent already recorded above (2026-08-16, recordOutcome/experienceId): both ids currently
+only ever come from a single validated proposal already scoped to one org's experience
+cluster, so the mismatch has no live path to happen yet. Revisit both entries together once
+reflect.ts or any future endpoint accepts these ids from outside that context.
+
+2026-08-17 — knowledge.ts's confidence decay uses a grace period (30 days) followed by daily
+multiplicative decay (1%/day), floored at a minimum of 0.05 so a knowledge item never fully
+vanishes. Nothing elsewhere in this repo specifies a decay formula — ARCHITECTURE.md asserts
+knowledge has "a decay policy" but never defines one, and DECISIONS.md had no prior entry
+either — so these are new, deliberately simple starting numbers, not a recorded requirement.
+Revisit once real usage data suggests a different grace period or rate is warranted.
