@@ -1,8 +1,17 @@
-import { Pool, type PoolConfig } from "pg";
+import { Pool, types, type PoolConfig } from "pg";
 import { loadConfig } from "../config.js";
 import { log } from "../logger.js";
 
 const DEFAULT_STATEMENT_TIMEOUT_MS = 10_000;
+
+// CockroachDB's INT defaults to 64-bit (INT8), and pg's own default parser returns INT8
+// (OID 20) as a string rather than a number, to avoid silently truncating values beyond
+// Number.MAX_SAFE_INTEGER. Every INT column in this schema today is a small counter
+// (reinforcement_count), so that precision concern doesn't apply here — see DECISIONS.md for
+// the tradeoff and what a future large-integer column would need to do instead. Registered
+// once at module load, not inside createPool(), since it's a global mutation on the pg
+// driver's type registry and calling it repeatedly is redundant.
+types.setTypeParser(20, (value: string) => parseInt(value, 10));
 
 /**
  * Connection string carries CockroachDB Cloud's sslmode (e.g. verify-full) already, so it's

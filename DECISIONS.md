@@ -213,3 +213,18 @@ retrying after a network timeout could double-increment reinforcement_count) is 
 lower-severity, pre-existing gap — deferred for the same reason recordExperience's 40001 retry
 comment already gives for not solving idempotency at this layer: no natural dedupe key exists
 yet, and request-level idempotency keys are a future concern for whatever endpoint calls this.
+
+2026-08-18 — createPool() (db/client.ts) registers a global pg type parser for OID 20 (INT8),
+coercing it via parseInt instead of pg's own default of returning it as a string. Found by
+actually running knowledge.ts's integration test against real CockroachDB (the unit suite's
+mocks always hand back a plain JS number, so this never surfaced there): CockroachDB's INT
+defaults to 64-bit (INT8), and pg's default parser deliberately returns INT8 as a string
+rather than a number, to avoid silently truncating a value beyond Number.MAX_SAFE_INTEGER —
+which meant `Knowledge.reinforcementCount` and `KnowledgeMatch.reinforcementCount` (both typed
+`number`) were actually strings ("1", not 1) at runtime the whole time. reinforcement_count is
+the only INT column in the schema today, and it's a small counter with no realistic path to
+exceeding safe-integer range, so a global coercion is safe here. This is a real precision
+tradeoff, not a free lunch: if a future column genuinely needs true 64-bit integers, it must
+not rely on this global parser — read it as a string explicitly and handle it with a bigint or
+string-based representation, or that column will silently truncate past 2^53-1 the same way
+this bug silently stringified before the fix.
