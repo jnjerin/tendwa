@@ -1,15 +1,36 @@
 import type { FastifyInstance } from "fastify";
-import { getExperienceById, recordExperience } from "../../../../packages/engine/src/memory/experience.js";
+import { ExperienceValidationError, getExperienceById, recordExperience } from "../../../../packages/engine/src/memory/experience.js";
 import { getOutcomeByExperienceId, recordOutcome } from "../../../../packages/engine/src/memory/outcome.js";
+import { queryRecentExperiences } from "../../../../packages/engine/src/memory/retrieve.js";
 import { runAgentLoop } from "../../../../packages/engine/src/agent/loop.js";
 import { recordAuditEntry } from "../../../../packages/engine/src/memory/auditLog.js";
 import { incidentToExperience, type Incident } from "../../../../domains/incident-response/mapping.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LIST_DEFAULT_LIMIT = 50;
+const LIST_MAX_LIMIT = 100;
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
 export async function incidentsRoutes(app: FastifyInstance): Promise<void> {
+  // GET /incidents?orgId=&domain=&limit= — smallest possible org-scoped list, reusing
+  // retrieve.ts's queryRecentExperiences (recency-ordered, structurally filtered) rather than
+  // adding a new engine function; org_id is required and validated here since
+  // queryRecentExperiences itself doesn't validate its inputs (it's a raw query helper).
+  app.get("/", async (request) => {
+    const query = request.query as Record<string, string | undefined>;
+    const orgId = query.orgId ?? "";
+    if (!UUID_RE.test(orgId)) {
+      throw new ExperienceValidationError("orgId is required and must be a UUID");
+    }
+    const parsedLimit = query.limit !== undefined ? Number(query.limit) : LIST_DEFAULT_LIMIT;
+    const limit = Number.isInteger(parsedLimit) && parsedLimit >= 1 && parsedLimit <= LIST_MAX_LIMIT ? parsedLimit : LIST_DEFAULT_LIMIT;
+    const items = await queryRecentExperiences(app.pool, orgId, query.domain, limit);
+    return { items };
+  });
+
   // POST /incidents — body: { orgId, title, description, service, environment, severity,
   // occurredAt, sourceUrl? }. Incident-shaped, not the engine's raw generic experience shape —
   // translated via domains/incident-response/mapping.ts's incidentToExperience, the same
@@ -93,6 +114,19 @@ export async function incidentsRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return result;
+  });
+
+  // GET /incidents/:id/outcome?orgId= — always 200 with { outcome: Outcome | null }, matching
+  // getOutcomeByExperienceId's own "no outcome yet is a normal state, not an error" contract.
+  // Needed so a client can render a previously-recorded outcome after a reload — without this,
+  // POST /incidents/:id/outcome's 201 response was the only place an outcome was ever visible.
+  app.get("/:id/outcome", async (request) => {
+    const { id } = request.params as { id: string };
+    const query = request.query as Record<string, string | undefined>;
+    const orgId = query.orgId ?? "";
+    await getExperienceById(app.pool, orgId, id, { requestId: request.id });
+    const outcome = await getOutcomeByExperienceId(app.pool, orgId, id, { requestId: request.id });
+    return { outcome };
   });
 
   // POST /incidents/:id/outcome — body: { orgId, status, actionTaken, result, rootCause? }

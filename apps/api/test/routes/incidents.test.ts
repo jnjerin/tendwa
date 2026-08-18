@@ -15,6 +15,12 @@ vi.mock("../../../../packages/engine/src/memory/experience.js", async (importOri
   };
 });
 
+const queryRecentExperiencesMock = vi.fn();
+vi.mock("../../../../packages/engine/src/memory/retrieve.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../../packages/engine/src/memory/retrieve.js")>();
+  return { ...actual, queryRecentExperiences: (...args: unknown[]) => queryRecentExperiencesMock(...args) };
+});
+
 const recordOutcomeMock = vi.fn();
 const getOutcomeByExperienceIdMock = vi.fn();
 vi.mock("../../../../packages/engine/src/memory/outcome.js", async (importOriginal) => {
@@ -50,6 +56,7 @@ function resetAllMocks() {
   getOutcomeByExperienceIdMock.mockReset();
   runAgentLoopMock.mockReset();
   recordAuditEntryMock.mockReset();
+  queryRecentExperiencesMock.mockReset();
 }
 
 const EXPERIENCE = {
@@ -61,6 +68,36 @@ const EXPERIENCE = {
   occurredAt: new Date("2026-08-15T10:00:00Z"),
   createdAt: new Date("2026-08-15T10:00:00Z"),
 };
+
+describe("GET /incidents", () => {
+  let app: FastifyInstance | undefined;
+
+  afterEach(async () => {
+    await app?.close();
+    app = undefined;
+    resetAllMocks();
+  });
+
+  it("returns { items } on the happy path", async () => {
+    queryRecentExperiencesMock.mockResolvedValue([EXPERIENCE]);
+    app = await buildApp({} as unknown as Pool);
+
+    const response = await app.inject({ method: "GET", url: `/incidents?orgId=${ORG_ID}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ items: [JSON.parse(JSON.stringify(EXPERIENCE))] });
+    expect(queryRecentExperiencesMock).toHaveBeenCalledWith({}, ORG_ID, undefined, 50);
+  });
+
+  it("returns 400 when orgId is missing or not a UUID", async () => {
+    app = await buildApp({} as unknown as Pool);
+
+    const response = await app.inject({ method: "GET", url: "/incidents" });
+
+    expect(response.statusCode).toBe(400);
+    expect(queryRecentExperiencesMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("POST /incidents", () => {
   let app: FastifyInstance | undefined;
@@ -267,6 +304,49 @@ describe("POST /incidents/:id/analyze", () => {
       expect.objectContaining({ query: "a different situation entirely" }),
       expect.anything(),
     );
+  });
+});
+
+describe("GET /incidents/:id/outcome", () => {
+  let app: FastifyInstance | undefined;
+
+  afterEach(async () => {
+    await app?.close();
+    app = undefined;
+    resetAllMocks();
+  });
+
+  it("returns { outcome: null } (200, not 404) when none has been recorded yet", async () => {
+    getExperienceByIdMock.mockResolvedValue(EXPERIENCE);
+    getOutcomeByExperienceIdMock.mockResolvedValue(null);
+    app = await buildApp({} as unknown as Pool);
+
+    const response = await app.inject({ method: "GET", url: `/incidents/${EXPERIENCE_ID}/outcome?orgId=${ORG_ID}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ outcome: null });
+  });
+
+  it("returns the outcome when one exists", async () => {
+    getExperienceByIdMock.mockResolvedValue(EXPERIENCE);
+    const outcome = { id: "44444444-4444-4444-4444-444444444444", orgId: ORG_ID, experienceId: EXPERIENCE_ID, status: "resolved", rootCause: null, actionTaken: "restarted", result: "fixed", createdAt: new Date() };
+    getOutcomeByExperienceIdMock.mockResolvedValue(outcome);
+    app = await buildApp({} as unknown as Pool);
+
+    const response = await app.inject({ method: "GET", url: `/incidents/${EXPERIENCE_ID}/outcome?orgId=${ORG_ID}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ outcome: JSON.parse(JSON.stringify(outcome)) });
+  });
+
+  it("404s when the experience doesn't exist or isn't owned by orgId", async () => {
+    getExperienceByIdMock.mockRejectedValue(new ExperienceNotFoundError("not found"));
+    app = await buildApp({} as unknown as Pool);
+
+    const response = await app.inject({ method: "GET", url: `/incidents/${EXPERIENCE_ID}/outcome?orgId=${ORG_ID}` });
+
+    expect(response.statusCode).toBe(404);
+    expect(getOutcomeByExperienceIdMock).not.toHaveBeenCalled();
   });
 });
 
