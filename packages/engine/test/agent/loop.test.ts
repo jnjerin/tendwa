@@ -155,6 +155,20 @@ describe("validateAgentProposal", () => {
   it("throws AgentProposalValidationError specifically", () => {
     expect(() => validateAgentProposal({}, makeRetrieval())).toThrow(AgentProposalValidationError);
   });
+
+  it("tolerates a bracket-label-prefixed citation and normalizes it to the bare id", () => {
+    const raw = { ...VALID_RAW_PROPOSAL, citedExperienceIds: ["experience:e1"], citedKnowledgeIds: ["knowledge:k1"] };
+    const proposal = validateAgentProposal(raw, makeRetrieval());
+    expect(proposal.citedExperienceIds).toEqual(["e1"]);
+    expect(proposal.citedKnowledgeIds).toEqual(["k1"]);
+  });
+
+  it("still rejects a fabricated id even when it carries a recognized prefix", () => {
+    const raw = { ...VALID_RAW_PROPOSAL, citedExperienceIds: ["experience:hallucinated-id"] };
+    expect(() => validateAgentProposal(raw, makeRetrieval())).toThrow(
+      /citedExperienceIds references an id that was not retrieved: hallucinated-id/,
+    );
+  });
 });
 
 describe("runAgentLoop", () => {

@@ -228,3 +228,21 @@ tradeoff, not a free lunch: if a future column genuinely needs true 64-bit integ
 not rely on this global parser — read it as a string explicitly and handle it with a bigint or
 string-based representation, or that column will silently truncate past 2^53-1 the same way
 this bug silently stringified before the fix.
+
+2026-08-18 — agent/loop.ts's citation format was genuinely ambiguous: the prompt labels each
+retrieved item in brackets as `[experience:<id>]`/`[knowledge:<id>]` and says to "cite those
+ids exactly as given," without saying whether "the id" means the bare id after the colon (what
+validateAgentProposal actually checks against) or the whole bracketed token including the type
+prefix. Found by running agent/loop.ts's integration test against a real Claude Sonnet 5 call
+(the mocked unit tests always hand back exactly the id string a test writes, so this ambiguity
+had no way to surface there): the model picked the "whole token" reading, cited
+`experience:<uuid>` instead of `<uuid>`, and validateAgentProposal correctly rejected it as
+"not retrieved" — the validator did its job, but the underlying citation was actually correct,
+so a working answer got wrongly downgraded to `status: "unavailable"`. Fixed on both ends: the
+prompt now spells out explicitly that the id is only the part after the colon, and
+validateAgentProposal strips a recognized `experience:`/`knowledge:` prefix (via
+stripCitationPrefix) before checking membership, so either reading of the original wording now
+resolves to the same validated citation. This doesn't weaken the actual security property —
+CLAUDE.md rule 4's "code validates, never trust the LLM's output directly" — because the
+stripped result still has to exactly match an id retrieval actually returned; a genuinely
+fabricated id, prefixed or not, is still rejected.

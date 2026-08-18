@@ -93,6 +93,19 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/**
+ * Tolerates the model citing the full bracketed label (e.g. "experience:abc-123") instead of
+ * the bare id (e.g. "abc-123") the prompt asks for — the two readings of "cite that id" are
+ * genuinely ambiguous from bracket notation alone (a real Sonnet 5 call picked the stricter
+ * reading; see DECISIONS.md), and a citation carrying the correct underlying id shouldn't be
+ * rejected just because of which reading the model happened to pick. Only strips an exact,
+ * recognized prefix — doesn't weaken rejection of a fabricated id, since the stripped result
+ * still has to match retrieval.experiences/retrieval.knowledge exactly, same as before.
+ */
+function stripCitationPrefix(id: string, prefix: string): string {
+  return id.startsWith(prefix) ? id.slice(prefix.length) : id;
+}
+
 function truncate(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
     return text;
@@ -126,10 +139,11 @@ export function buildPrompt(input: AgentLoopInput, retrieval: RetrievalResult): 
     "You help an operations team reason about a new situation by comparing it against",
     "similar past experiences and distilled knowledge from the organization's history.",
     "Base your answer only on the experiences and knowledge listed in the user message —",
-    "never invent or assume details that aren't there. Every experience and knowledge",
-    "item is labeled with an id in brackets, e.g. [experience:abc-123] or",
-    "[knowledge:def-456]. When you cite support for your reasoning, cite those ids",
-    "exactly as given — never a new id, and never an id for an item that wasn't listed.",
+    "never invent or assume details that aren't there. Every experience and knowledge item",
+    "is labeled in brackets as [experience:<id>] or [knowledge:<id>] — the id is only the",
+    "part after the colon: for [experience:abc-123] the id is abc-123, not",
+    '"experience:abc-123". When you cite support for your reasoning, cite only that bare id',
+    "— never a new id, and never an id for an item that wasn't listed.",
     "Respond with your assessment of the likely cause, a concrete recommendation, your",
     "confidence in that assessment as a number between 0 and 1, and the ids of the",
     "experiences and knowledge items that actually support your reasoning.",
@@ -194,8 +208,13 @@ export function validateAgentProposal(raw: unknown, retrieval: RetrievalResult):
     throw new AgentProposalValidationError("citedKnowledgeIds must be an array of strings");
   }
 
+  // Tolerates a cited id carrying its bracket-label prefix ("experience:abc-123") instead of
+  // the bare id the prompt asks for — see stripCitationPrefix's doc comment.
+  const normalizedExperienceIds = (citedExperienceIds as string[]).map((id) => stripCitationPrefix(id, "experience:"));
+  const normalizedKnowledgeIds = (citedKnowledgeIds as string[]).map((id) => stripCitationPrefix(id, "knowledge:"));
+
   const validExperienceIds = new Set(retrieval.experiences.map((experience) => experience.id));
-  for (const id of citedExperienceIds as string[]) {
+  for (const id of normalizedExperienceIds) {
     if (!validExperienceIds.has(id)) {
       throw new AgentProposalValidationError(`citedExperienceIds references an id that was not retrieved: ${id}`);
     }
@@ -204,13 +223,13 @@ export function validateAgentProposal(raw: unknown, retrieval: RetrievalResult):
   // No knowledge was ever in context to cite, so any id here — however plausible-looking
   // — is fabricated. Checked before the membership loop below so the error names the
   // real problem (unavailable, not "not retrieved") when both would technically fire.
-  if (retrieval.knowledgeUnavailable && citedKnowledgeIds.length > 0) {
+  if (retrieval.knowledgeUnavailable && normalizedKnowledgeIds.length > 0) {
     throw new AgentProposalValidationError(
       "citedKnowledgeIds must be empty when knowledge retrieval was unavailable",
     );
   }
   const validKnowledgeIds = new Set(retrieval.knowledge.map((knowledge) => knowledge.id));
-  for (const id of citedKnowledgeIds as string[]) {
+  for (const id of normalizedKnowledgeIds) {
     if (!validKnowledgeIds.has(id)) {
       throw new AgentProposalValidationError(`citedKnowledgeIds references an id that was not retrieved: ${id}`);
     }
@@ -220,8 +239,8 @@ export function validateAgentProposal(raw: unknown, retrieval: RetrievalResult):
     likelyCause: (candidate.likelyCause as string).trim(),
     recommendation: (candidate.recommendation as string).trim(),
     confidence,
-    citedExperienceIds: citedExperienceIds as string[],
-    citedKnowledgeIds: citedKnowledgeIds as string[],
+    citedExperienceIds: normalizedExperienceIds,
+    citedKnowledgeIds: normalizedKnowledgeIds,
     knowledgeUnavailable: retrieval.knowledgeUnavailable,
   };
 }
