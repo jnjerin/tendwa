@@ -366,3 +366,78 @@ resolves to the same validated citation. This doesn't weaken the actual security
 CLAUDE.md rule 4's "code validates, never trust the LLM's output directly" — because the
 stripped result still has to exactly match an id retrieval actually returned; a genuinely
 fabricated id, prefixed or not, is still rejected.
+
+2026-08-18 — Added apps/api (Fastify) and apps/worker (Lambda), the first external-facing
+consumers of packages/engine. Three read paths the engine genuinely didn't have yet were added
+first, in the exact style of their sibling functions, since the required GET routes had nothing
+to call: getExperienceById + ExperienceNotFoundError (experience.ts), and
+listKnowledge/getKnowledgeById/validateListKnowledge (knowledge.ts). listKnowledge uses its own
+LIST_DEFAULT_LIMIT/LIST_MAX_LIMIT (20/100) rather than retrieve.ts's retrieval-sized limits,
+since it's a browsing/dashboard list, not bounded LLM context, and has no keyset pagination yet
+— a bounded `limit` is enough at this project's actual scale, revisit if a real dashboard needs
+"load more" paging. logger.ts's inline pino options object was extracted into an exported
+`pinoOptions` constant so apps/api can build Fastify's own logger from the exact same redact
+config rather than a second, hand-copied one — this exact redact list already caused one real
+bug from drift once before (see the 2026-08-16 entry), and a second independently-maintained
+copy anywhere else in the repo would just reintroduce that risk for no benefit.
+
+2026-08-18 — POST /incidents/:id/outcome (apps/api) looks up the experience via
+getExperienceById before calling recordOutcome, 404ing if it doesn't exist or doesn't belong to
+orgId. This is the ownership check the 2026-08-16 entry on recordOutcome named this exact future
+endpoint as the point where a mismatched org_id/experience_id pair becomes reachable — closed
+here the same way addEvidence's ownership check closed the analogous gap for knowledge_evidence.
+
+2026-08-18 — Added getOutcomeByExperienceId (outcome.ts) and used it in POST
+/incidents/:id/outcome to reject a duplicate outcome for the same experience with 409, rather
+than silently inserting a second row. outcomes has no unique constraint on experience_id, and
+recordOutcome itself has never checked for one (a deliberately deferred gap — see the
+2026-08-16 entry, "outcomes has no natural dedupe key either"). That was a defensible deferral
+as long as recordOutcome's only callers were single-shot scripts; production-reviewer flagged
+that this endpoint changes the picture — it's the first HTTP-reachable, retry-prone caller, and
+reflect.ts's own EXPERIENCE_OUTCOME_SELECT comment already documents an assumption of "at most
+one outcome per experience" that a duplicate row would silently violate, feeding double-counted
+evidence into knowledge distillation. No schema change (no unique constraint) — an
+application-level check before the write was enough to close the gap without touching the
+schema outside Plan mode.
+
+2026-08-18 — POST /incidents/:id/analyze (apps/api) now writes one agent_audit_log entry per
+call via recordAuditEntry (action "agent.analyze", detail carries the proposal or the
+unavailable-reason) — this is the audit write the 2026-08-17 entry on agent/loop.ts explicitly
+deferred to this future endpoint, covering both the status:"ok" and status:"unavailable"
+branches (CLAUDE.md rule 4 treats a degraded/unavailable result as an agent decision worth a
+durable record too, not just a successful proposal). The audit write is wrapped in its own
+try/catch, separate from the agent loop call: production-reviewer found that an unguarded
+await let a recordAuditEntry failure turn an already-computed, possibly LLM-costly agent result
+into a bare 500 — inverting ENGINEERING.md §1's graceful-degradation intent for this exact
+endpoint, where a secondary (audit) write failing should never discard a valid primary result.
+A failed audit write is now logged loudly (agent_audit_log is the durable audit trail, not just
+an operational log line) but the agent result is still returned to the caller.
+
+2026-08-18 — Neither POST /incidents/:id/analyze nor POST /incidents/:id/outcome gets a request-
+level idempotency key. /analyze doesn't need one: a duplicate call produces two accurate,
+independent agent_audit_log entries (each a real invocation, not a fabricated duplicate) and one
+extra bounded LLM call — a cost, not a correctness problem, since /analyze never mutates
+incident data. /outcome's duplicate-row risk is closed by the 409 guard above instead of a
+dedupe key, since a plain existence check was cheaper than adding one and didn't need a schema
+change.
+
+2026-08-18 — @tendwa/api registers @fastify/cors with `origin: true` (reflects the request's own
+Origin rather than a maintained allowlist) — apps/web (the Next.js dashboard) is next on the
+roadmap and will call this API cross-origin in local dev, and adding CORS now avoids losing time
+later to what looks like an API bug but is actually a missing plugin on the first frontend
+fetch. Permissive is the right level of effort here: PROJECT.md's MVP scope explicitly excludes
+authentication/authorization, so there's no auth/cookie boundary anywhere in the API for a
+permissive origin to actually weaken, and org-scoping is still enforced at the query layer
+regardless of request origin.
+
+2026-08-18 — apps/worker/src/handler.ts calls packages/engine's runReflection() directly,
+in-process, rather than making an HTTP call to POST /reflection/run. This is a deliberate
+reading of ARCHITECTURE.md's now-corrected "Lambda calls this on schedule" note: it named the
+manual/dashboard trigger path, while the actual scheduled job calls straight into the engine it
+already shares a workspace with — avoiding giving the Lambda network/auth access to the API for
+a call that's trusted and internal anyway, and reusing createPool()/runReflection() verbatim
+with nothing duplicated from reflect.ts. POST /reflection/run remains for manual/dashboard-
+triggered runs. The Lambda's Pool is created once at module scope and reused across warm
+invocations (never `.end()`ed inside the handler, matching the standard Lambda+pg pattern), and
+errors from runReflection are deliberately left uncaught so Lambda's own retry/alerting
+semantics fire — a retry lands on runReflection's existing agent_state crash-resume path.

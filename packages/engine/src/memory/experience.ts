@@ -50,6 +50,15 @@ export class ExperienceValidationError extends Error {
   }
 }
 
+/** Thrown when an org-scoped experience id doesn't resolve to a row — wrong id or wrong org,
+ *  matching KnowledgeNotFoundError's collapsed-cause rationale (knowledge.ts). */
+export class ExperienceNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExperienceNotFoundError";
+  }
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -177,4 +186,66 @@ export async function recordExperience(
       await delay(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
     }
   }
+}
+
+/**
+ * Single-statement read (no retry — same convention as retrieve.ts's queries and
+ * knowledge.ts's decay lookup: CockroachDB retries an implicit single-statement transaction
+ * internally, so there's no client-side 40001 to handle here). org_id and id are checked in the
+ * same WHERE clause, and a miss on either collapses to the same ExperienceNotFoundError, so this
+ * can't be used to probe for another org's experience ids — matching KnowledgeNotFoundError's
+ * stated rationale exactly.
+ */
+export async function getExperienceById(
+  pool: Pool,
+  orgId: string,
+  experienceId: string,
+  context: { requestId?: string } = {},
+): Promise<Experience> {
+  if (!isNonEmptyString(orgId) || !UUID_RE.test(orgId)) {
+    const err = new ExperienceValidationError("orgId is required and must be a UUID");
+    log("warn", "Rejected invalid experience lookup", {
+      service: "engine",
+      component: "memory.experience",
+      operation: "experience.getById",
+      requestId: context.requestId,
+      errorCode: "EXPERIENCE_VALIDATION_FAILED",
+      err,
+    });
+    throw err;
+  }
+  if (!isNonEmptyString(experienceId) || !UUID_RE.test(experienceId)) {
+    const err = new ExperienceValidationError("experienceId is required and must be a UUID");
+    log("warn", "Rejected invalid experience lookup", {
+      service: "engine",
+      component: "memory.experience",
+      operation: "experience.getById",
+      requestId: context.requestId,
+      orgId,
+      errorCode: "EXPERIENCE_VALIDATION_FAILED",
+      err,
+    });
+    throw err;
+  }
+
+  const result = await pool.query<ExperienceRow>(
+    `SELECT id, org_id, domain, content, metadata, occurred_at, created_at
+     FROM experiences
+     WHERE org_id = $1 AND id = $2`,
+    [orgId, experienceId],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    log("warn", "Experience not found", {
+      service: "engine",
+      component: "memory.experience",
+      operation: "experience.getById",
+      requestId: context.requestId,
+      orgId,
+      experienceId,
+      errorCode: "EXPERIENCE_NOT_FOUND",
+    });
+    throw new ExperienceNotFoundError(`No experience found for org ${orgId} with id ${experienceId}`);
+  }
+  return mapRow(row);
 }

@@ -15,9 +15,12 @@ const {
   calculateDecayedConfidence,
   createKnowledge,
   decayKnowledgeConfidence,
+  getKnowledgeById,
+  listKnowledge,
   reinforceKnowledge,
   validateAddEvidence,
   validateDecayKnowledgeInput,
+  validateListKnowledge,
   validateNewKnowledge,
   validateReinforceKnowledge,
 } = await import("../../src/memory/knowledge.js");
@@ -156,6 +159,32 @@ describe("validateDecayKnowledgeInput", () => {
   it("rejects an invalid knowledgeId", () => {
     expect(() => validateDecayKnowledgeInput({ orgId: ORG_ID, knowledgeId: "nope" })).toThrow(
       /knowledgeId must be a UUID/,
+    );
+  });
+});
+
+describe("validateListKnowledge", () => {
+  it("defaults limit to 20 and leaves domain undefined when omitted", () => {
+    expect(validateListKnowledge({ orgId: ORG_ID })).toEqual({ domain: undefined, limit: 20 });
+  });
+
+  it("trims domain", () => {
+    expect(validateListKnowledge({ orgId: ORG_ID, domain: "  ops  " })).toEqual({ domain: "ops", limit: 20 });
+  });
+
+  it("rejects an invalid orgId", () => {
+    expect(() => validateListKnowledge({ orgId: "not-a-uuid" })).toThrow(/orgId must be a UUID/);
+  });
+
+  it("rejects a limit above 100", () => {
+    expect(() => validateListKnowledge({ orgId: ORG_ID, limit: 101 })).toThrow(
+      /limit must be an integer between 1 and 100/,
+    );
+  });
+
+  it("rejects a non-integer limit", () => {
+    expect(() => validateListKnowledge({ orgId: ORG_ID, limit: 1.5 })).toThrow(
+      /limit must be an integer between 1 and 100/,
     );
   });
 });
@@ -331,5 +360,65 @@ describe("decayKnowledgeConfidence", () => {
     await expect(decayKnowledgeConfidence(pool, { orgId: ORG_ID, knowledgeId: KNOWLEDGE_ID })).rejects.toThrow(
       KnowledgeNotFoundError,
     );
+  });
+});
+
+describe("listKnowledge", () => {
+  it("returns rows mapped to Knowledge, most-recent-first per the ORDER BY", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [makeRow(), makeRow({ id: "44444444-4444-4444-4444-444444444444" })] });
+    const pool = { query } as unknown as Pool;
+
+    const items = await listKnowledge(pool, { orgId: ORG_ID });
+
+    expect(items).toHaveLength(2);
+    expect(items[0]?.id).toBe(KNOWLEDGE_ID);
+    const [, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual([ORG_ID, null, 20]);
+  });
+
+  it("passes a trimmed domain filter through to the query", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = { query } as unknown as Pool;
+
+    await listKnowledge(pool, { orgId: ORG_ID, domain: "  ops  ", limit: 5 });
+
+    const [, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual([ORG_ID, "ops", 5]);
+  });
+
+  it("rejects invalid input before querying", async () => {
+    const query = vi.fn();
+    const pool = { query } as unknown as Pool;
+
+    await expect(listKnowledge(pool, { orgId: "not-a-uuid" })).rejects.toThrow(KnowledgeValidationError);
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe("getKnowledgeById", () => {
+  it("returns the mapped row when found", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [makeRow()] });
+    const pool = { query } as unknown as Pool;
+
+    const knowledge = await getKnowledgeById(pool, ORG_ID, KNOWLEDGE_ID);
+
+    expect(knowledge.id).toBe(KNOWLEDGE_ID);
+    const [, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual([ORG_ID, KNOWLEDGE_ID]);
+  });
+
+  it("throws KnowledgeNotFoundError when the org-scoped row doesn't exist", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = { query } as unknown as Pool;
+
+    await expect(getKnowledgeById(pool, ORG_ID, KNOWLEDGE_ID)).rejects.toThrow(KnowledgeNotFoundError);
+  });
+
+  it("rejects an invalid knowledgeId before querying", async () => {
+    const query = vi.fn();
+    const pool = { query } as unknown as Pool;
+
+    await expect(getKnowledgeById(pool, ORG_ID, "not-a-uuid")).rejects.toThrow(KnowledgeValidationError);
+    expect(query).not.toHaveBeenCalled();
   });
 });

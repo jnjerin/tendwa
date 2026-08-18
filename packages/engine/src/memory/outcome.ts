@@ -177,3 +177,50 @@ export async function recordOutcome(
     }
   }
 }
+
+/**
+ * Single-statement read (no retry — same convention as retrieve.ts's queries), used to check
+ * for an already-recorded outcome before writing a new one. Returns null on a miss rather than
+ * throwing — "no outcome yet" is the expected, common case here, not an error.
+ *
+ * outcomes has no unique constraint on experience_id (no schema change is in scope for this
+ * function), and reflect.ts's own EXPERIENCE_OUTCOME_SELECT comment already documents an
+ * assumption of "at most one outcome per experience" that a duplicate row would silently
+ * violate — this function exists so a caller (POST /incidents/:id/outcome) can enforce that
+ * invariant at the application layer instead of leaving it merely assumed.
+ */
+export async function getOutcomeByExperienceId(
+  pool: Pool,
+  orgId: string,
+  experienceId: string,
+  context: { requestId?: string } = {},
+): Promise<Outcome | null> {
+  if (!isNonEmptyString(orgId) || !UUID_RE.test(orgId)) {
+    throw new OutcomeValidationError("orgId is required and must be a UUID");
+  }
+  if (!isNonEmptyString(experienceId) || !UUID_RE.test(experienceId)) {
+    throw new OutcomeValidationError("experienceId is required and must be a UUID");
+  }
+
+  const result = await pool.query<OutcomeRow>(
+    `SELECT id, org_id, experience_id, status, root_cause, action_taken, result, created_at
+     FROM outcomes
+     WHERE org_id = $1 AND experience_id = $2
+     LIMIT 1`,
+    [orgId, experienceId],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+  log("info", "Found an existing outcome for this experience", {
+    service: "engine",
+    component: "memory.outcome",
+    operation: "outcome.getByExperienceId",
+    requestId: context.requestId,
+    orgId,
+    experienceId,
+    outcomeId: row.id,
+  });
+  return mapRow(row);
+}

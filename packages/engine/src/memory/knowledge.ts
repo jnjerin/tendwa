@@ -78,6 +78,18 @@ export interface DecayKnowledgeInput {
   knowledgeId: string;
 }
 
+export interface ListKnowledgeInput {
+  orgId: string;
+  domain?: string;
+  limit?: number;
+}
+
+// Separate from retrieve.ts's DEFAULT_LIMIT/MAX_LIMIT: those bound an LLM's retrieved context
+// (deliberately small), while this bounds a browsing/dashboard listing — a different, larger
+// scale is reasonable here without implying anything about retrieval prompt sizing.
+const LIST_DEFAULT_LIMIT = 20;
+const LIST_MAX_LIMIT = 100;
+
 interface KnowledgeRow {
   id: string;
   org_id: string;
@@ -229,6 +241,26 @@ export function validateDecayKnowledgeInput(input: DecayKnowledgeInput): void {
   if (!UUID_RE.test(input.knowledgeId)) {
     throw new KnowledgeValidationError("knowledgeId must be a UUID");
   }
+}
+
+/** Pure, independent of any DB connection — matches validateRetrieveMemoryInput's normalization
+ *  style (retrieve.ts): trims domain, bounds limit to [1, LIST_MAX_LIMIT] with LIST_DEFAULT_LIMIT
+ *  as the default. */
+export function validateListKnowledge(input: ListKnowledgeInput): { domain: string | undefined; limit: number } {
+  if (!isNonEmptyString(input.orgId)) {
+    throw new KnowledgeValidationError("orgId is required");
+  }
+  if (!UUID_RE.test(input.orgId)) {
+    throw new KnowledgeValidationError("orgId must be a UUID");
+  }
+  if (input.domain !== undefined && !isNonEmptyString(input.domain)) {
+    throw new KnowledgeValidationError("domain must be a non-empty string when provided");
+  }
+  const limit = input.limit ?? LIST_DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > LIST_MAX_LIMIT) {
+    throw new KnowledgeValidationError(`limit must be an integer between 1 and ${LIST_MAX_LIMIT}`);
+  }
+  return { domain: input.domain?.trim(), limit };
 }
 
 /**
@@ -668,4 +700,100 @@ export async function decayKnowledgeConfidence(
     confidence: knowledge.confidence,
   });
   return knowledge;
+}
+
+/**
+ * Browsing/dashboard listing (Stage 3 read path) — most-recently-created first, bounded by
+ * `limit`, optionally filtered by domain. No keyset pagination yet: a bounded `limit` is enough
+ * for this project's actual scale (ENGINEERING.md's "not enterprise-scale for its own sake"),
+ * and there's no dashboard consumer yet that needs real "load more" paging. Revisit if one does.
+ */
+export async function listKnowledge(
+  pool: Pool,
+  input: ListKnowledgeInput,
+  context: { requestId?: string } = {},
+): Promise<Knowledge[]> {
+  let normalized: { domain: string | undefined; limit: number };
+  try {
+    normalized = validateListKnowledge(input);
+  } catch (err) {
+    log("warn", "Rejected invalid knowledge list request", {
+      service: "engine",
+      component: "memory.knowledge",
+      operation: "knowledge.list",
+      requestId: context.requestId,
+      orgId: typeof input.orgId === "string" ? input.orgId : undefined,
+      errorCode: "KNOWLEDGE_VALIDATION_FAILED",
+      err: err as Error,
+    });
+    throw err;
+  }
+
+  const result = await pool.query<KnowledgeRow>(
+    `SELECT id, org_id, domain, statement, confidence, reinforcement_count, last_reinforced_at, created_at
+     FROM knowledge
+     WHERE org_id = $1
+       AND ($2::STRING IS NULL OR domain = $2)
+     ORDER BY created_at DESC
+     LIMIT $3::INT8`,
+    [input.orgId, normalized.domain ?? null, normalized.limit],
+  );
+  const items = result.rows.map(mapRow);
+  log("info", "Listed knowledge", {
+    service: "engine",
+    component: "memory.knowledge",
+    operation: "knowledge.list",
+    requestId: context.requestId,
+    orgId: input.orgId,
+    count: items.length,
+  });
+  return items;
+}
+
+/**
+ * Single-statement read (no retry — same convention as decayKnowledgeConfidence's lookup and
+ * retrieve.ts's queries). Reuses validateDecayKnowledgeInput since both take the identical
+ * {orgId, knowledgeId} shape — no need for a third near-duplicate validator.
+ */
+export async function getKnowledgeById(
+  pool: Pool,
+  orgId: string,
+  knowledgeId: string,
+  context: { requestId?: string } = {},
+): Promise<Knowledge> {
+  try {
+    validateDecayKnowledgeInput({ orgId, knowledgeId });
+  } catch (err) {
+    log("warn", "Rejected invalid knowledge lookup", {
+      service: "engine",
+      component: "memory.knowledge",
+      operation: "knowledge.getById",
+      requestId: context.requestId,
+      orgId: typeof orgId === "string" ? orgId : undefined,
+      errorCode: "KNOWLEDGE_VALIDATION_FAILED",
+      err: err as Error,
+    });
+    throw err;
+  }
+
+  const result = await pool.query<KnowledgeRow>(
+    `SELECT id, org_id, domain, statement, confidence, reinforcement_count, last_reinforced_at, created_at
+     FROM knowledge
+     WHERE org_id = $1 AND id = $2`,
+    [orgId, knowledgeId],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    log("warn", "Knowledge not found", {
+      service: "engine",
+      component: "memory.knowledge",
+      operation: "knowledge.getById",
+      requestId: context.requestId,
+      orgId,
+      knowledgeId,
+      errorCode: "KNOWLEDGE_NOT_FOUND",
+    });
+    throw new KnowledgeNotFoundError(`No knowledge found for org ${orgId} with id ${knowledgeId}`);
+  }
+  return mapRow(row);
 }

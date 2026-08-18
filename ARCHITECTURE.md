@@ -235,7 +235,9 @@ GET    /incidents/:id
 POST   /incidents/:id/analyze      # retrieve memory + agent reasoning → recommendation
 POST   /incidents/:id/outcome      # record what actually happened
 GET    /memory/search
-POST   /reflection/run             # trigger reflection manually (Lambda calls this on schedule)
+POST   /reflection/run             # manual/dashboard-triggered run — the scheduled Lambda
+                                    # (apps/worker) calls runReflection() directly, in-process,
+                                    # not through this HTTP route (see DECISIONS.md)
 GET    /knowledge
 GET    /knowledge/:id
 GET    /health                      # liveness — is the process running
