@@ -130,6 +130,7 @@ function makeState(payload: ReflectionRunPayload, overrides: Partial<AgentStateR
     step: "reflection",
     payload,
     updatedAt: new Date("2026-08-18T00:00:00Z"),
+    updatedAtRaw: "2026-08-18 00:00:00.000000+00",
     ...overrides,
   };
 }

@@ -441,3 +441,29 @@ triggered runs. The Lambda's Pool is created once at module scope and reused acr
 invocations (never `.end()`ed inside the handler, matching the standard Lambda+pg pattern), and
 errors from runReflection are deliberately left uncaught so Lambda's own retry/alerting
 semantics fire — a retry lands on runReflection's existing agent_state crash-resume path.
+
+2026-08-18 — Fixed a real bug in resumeReflectionRun's (agentState.ts) crash-recovery compare-
+and-swap: it deterministically failed to resume ANY interrupted reflection run, every time, not
+just under genuine concurrent access. Found live, running reflection against the real demo org
+after it hit Voyage's free-tier 3 RPM limit mid-run (expected and handled per the 2026-08-16
+entry on embedText's no-retry stance) — the resume that should have picked up where it left off
+instead reported "claim lost" on every attempt, with nothing else concurrently touching the row.
+Root cause: CockroachDB's `now()` has microsecond precision, but pg's driver parses a
+TIMESTAMPTZ column into a JS `Date` (millisecond precision only); `findActiveReflectionState`
+read `updated_at` into such a `Date`, and `resumeReflectionRun`'s `WHERE updated_at = $3`
+compared that already-truncated value against the still-full-precision value actually stored —
+an equality check that only ever matches if the sub-millisecond digits happen to be exactly
+zero, which they essentially never are for a real `now()`. This is invisible to the existing
+mocked-`Pool` unit tests (a hand-constructed mock `Date` trivially equals itself; no real
+CockroachDB round trip ever happens), so it could only surface against the live cluster — this
+is exactly the class of gap CLAUDE.md rule 7 exists to catch, though here the miss was a testing
+gap rather than a stale-docs one. Fixed by having `SELECT_COLUMNS` also select
+`updated_at::STRING AS updated_at_raw` (CockroachDB's own full-precision string form, computed
+server-side) and exposing it as `AgentStateRow.updatedAtRaw`; `resumeReflectionRun` now takes
+that raw string instead of a `Date` and compares it via `updated_at = $3::TIMESTAMPTZ`, so the
+comparison value never passes through a lossy JS `Date` at any point. Verified by re-running
+reflection against the real demo org's stuck 'failed' run: before the fix it failed to resume on
+every attempt with no other process touching the row; after, it correctly resumed and processed
+the next pending groups. `AgentStateRow.updatedAt: Date` is left in place unchanged for every
+other existing use of the row (logging, etc.) — only the CAS comparison itself switches to the
+raw string.

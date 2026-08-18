@@ -95,6 +95,9 @@ export interface AgentStateRow {
   step: string;
   payload: ReflectionRunPayload | null;
   updatedAt: Date;
+  /** Full-precision (microsecond) CockroachDB-native string form of updated_at — see
+   *  resumeReflectionRun's comment for why this exists alongside updatedAt: Date. */
+  updatedAtRaw: string;
 }
 
 interface AgentStateDbRow {
@@ -104,6 +107,7 @@ interface AgentStateDbRow {
   step: string;
   payload: ReflectionRunPayload | null;
   updated_at: Date;
+  updated_at_raw: string;
 }
 
 export class AgentStateValidationError extends Error {
@@ -134,6 +138,7 @@ function mapRow(row: AgentStateDbRow): AgentStateRow {
     step: row.step,
     payload: row.payload,
     updatedAt: row.updated_at,
+    updatedAtRaw: row.updated_at_raw,
   };
 }
 
@@ -166,7 +171,11 @@ async function withSerializationRetry<T>(
   }
 }
 
-const SELECT_COLUMNS = "id, org_id, status, step, payload, updated_at";
+// updated_at::STRING is included alongside the plain column so resumeReflectionRun can compare
+// against CockroachDB's own full-precision (microsecond) string representation instead of a
+// JS Date — see that function's comment for why the plain Date column alone isn't safe to use
+// as an optimistic-concurrency comparison value.
+const SELECT_COLUMNS = "id, org_id, status, step, payload, updated_at, updated_at::STRING AS updated_at_raw";
 
 /**
  * Finds a reflection run that hasn't reached a terminal 'completed' state — either genuinely
@@ -262,12 +271,23 @@ export async function claimReflectionRun(
  * at-least-once semantics is the realistic trigger — see ARCHITECTURE.md's deployment model)
  * both trying to resume the same run. Returns null, not an error, when the swap affects zero
  * rows — that's a normal, expected outcome ("someone else already claimed it"), not a failure.
+ *
+ * `expectedUpdatedAt` takes the raw, full-precision string form (AgentStateRow.updatedAtRaw),
+ * not a JS Date, and the comparison below casts it back to TIMESTAMPTZ rather than relying on
+ * a Date round-trip. Found live against tendwa_test: CockroachDB's `now()` has microsecond
+ * precision, but pg's driver parses TIMESTAMPTZ into a JS Date (millisecond precision only) —
+ * a Date built from the SELECT's value and then re-sent as this UPDATE's parameter silently
+ * loses the sub-millisecond digits, so `updated_at = $3` almost never matched the still-full-
+ * precision value actually stored, and every resume deterministically failed with "claim lost"
+ * even with no real concurrent claimant. Comparing CockroachDB's own `::STRING` cast of the
+ * column (server-side, full precision) against a parameter cast back with `::TIMESTAMPTZ`
+ * never touches a lossy JS Date for this value, so the round trip is exact.
  */
 export async function resumeReflectionRun(
   pool: Pool,
   stateId: string,
   orgId: string,
-  expectedUpdatedAt: Date,
+  expectedUpdatedAt: string,
   context: { requestId?: string } = {},
 ): Promise<AgentStateRow | null> {
   validateOrgId(orgId);
@@ -276,7 +296,7 @@ export async function resumeReflectionRun(
       pool.query<AgentStateDbRow>(
         `UPDATE agent_state
          SET status = 'running', updated_at = now()
-         WHERE id = $1 AND org_id = $2 AND updated_at = $3 AND status != 'completed'
+         WHERE id = $1 AND org_id = $2 AND updated_at = $3::TIMESTAMPTZ AND status != 'completed'
          RETURNING ${SELECT_COLUMNS}`,
         [stateId, orgId, expectedUpdatedAt],
       ),

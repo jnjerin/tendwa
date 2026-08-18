@@ -34,6 +34,7 @@ function makeDbRow(overrides: Record<string, unknown> = {}) {
     step: "reflection",
     payload: makePayload(),
     updated_at: new Date("2026-08-18T00:00:00.000Z"),
+    updated_at_raw: "2026-08-18 00:00:00.000000+00",
     ...overrides,
   };
 }
@@ -55,8 +56,10 @@ describe("findActiveReflectionState", () => {
     expect(state?.id).toBe(STATE_ID);
     expect(state?.status).toBe("running");
     expect(state?.payload?.runId).toBe("44444444-4444-4444-4444-444444444444");
+    expect(state?.updatedAtRaw).toBe("2026-08-18 00:00:00.000000+00");
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toMatch(/status != 'completed'/);
+    expect(sql).toMatch(/updated_at::STRING AS updated_at_raw/);
     expect(params).toEqual([ORG_ID, "reflection"]);
   });
 
@@ -101,17 +104,20 @@ describe("claimReflectionRun", () => {
 });
 
 describe("resumeReflectionRun", () => {
-  it("claims the row via compare-and-swap and returns the mapped state", async () => {
+  it("claims the row via compare-and-swap on the raw full-precision string and returns the mapped state", async () => {
     const query = vi.fn().mockResolvedValue({ rows: [makeDbRow()] });
     const pool = { query } as unknown as Pool;
-    const expectedUpdatedAt = new Date("2026-08-18T00:00:00.000Z");
+    // Deliberately carries sub-millisecond precision — this is exactly the value a JS Date
+    // round-trip would have silently truncated, which is the bug this comparison strategy fixes.
+    const expectedUpdatedAt = "2026-08-18 00:00:00.123456+00";
 
     const state = await resumeReflectionRun(pool, STATE_ID, ORG_ID, expectedUpdatedAt);
 
     expect(state?.id).toBe(STATE_ID);
+    expect(state?.updatedAtRaw).toBe("2026-08-18 00:00:00.000000+00");
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toMatch(/UPDATE agent_state/);
-    expect(sql).toMatch(/updated_at = \$3/);
+    expect(sql).toMatch(/updated_at = \$3::TIMESTAMPTZ/);
     expect(params).toEqual([STATE_ID, ORG_ID, expectedUpdatedAt]);
   });
 
@@ -119,7 +125,7 @@ describe("resumeReflectionRun", () => {
     const query = vi.fn().mockResolvedValue({ rows: [] });
     const pool = { query } as unknown as Pool;
 
-    const state = await resumeReflectionRun(pool, STATE_ID, ORG_ID, new Date());
+    const state = await resumeReflectionRun(pool, STATE_ID, ORG_ID, "2026-08-18 00:00:00.000000+00");
 
     expect(state).toBeNull();
   });

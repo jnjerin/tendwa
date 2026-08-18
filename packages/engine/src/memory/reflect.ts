@@ -760,7 +760,7 @@ export async function runReflection(
   let state: AgentStateRow;
 
   if (active) {
-    const resumed = await resumeReflectionRun(pool, active.id, orgId, active.updatedAt, context);
+    const resumed = await resumeReflectionRun(pool, active.id, orgId, active.updatedAtRaw, context);
     if (!resumed) {
       log("info", "Another reflection run is already in progress for this org, skipping", {
         service: "engine",
