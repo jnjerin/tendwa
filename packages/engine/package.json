@@ -7,6 +7,7 @@
     "typecheck": "tsc --noEmit",
     "migrate": "tsx src/db/migrate.ts",
     "migrate:test": "tsx src/db/migrate.ts --test",
+    "reflect": "tsx src/memory/reflect.ts",
     "test": "vitest run --exclude \"**/*.integration.test.ts\"",
     "test:integration": "vitest run integration.test.ts"
   },

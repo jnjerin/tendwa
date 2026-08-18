@@ -229,6 +229,126 @@ not rely on this global parser — read it as a string explicitly and handle it 
 string-based representation, or that column will silently truncate past 2^53-1 the same way
 this bug silently stringified before the fix.
 
+2026-08-18 — Added packages/engine/src/memory/agentState.ts and auditLog.ts as new,
+reflection-specific helper modules, ahead of reflect.ts itself. agentState.ts owns
+find/claim/resume/checkpoint/complete/fail operations against agent_state (no prior read/write
+helper existed for that table at all) plus the ReflectionRunPayload/ReflectionGroupState
+checkpoint schema; auditLog.ts owns the one INSERT into agent_audit_log. Split into their own
+files rather than inlined in reflect.ts to match the established one-file-per-table convention
+(experience.ts, outcome.ts, knowledge.ts), and because agent_state's find/claim/checkpoint shape
+isn't inherently reflection-specific — a future resumable agent loop could reuse the same table
+and retry/logging conventions without touching reflect.ts.
+
+2026-08-18 — reflect.ts's eligibility scope for "experiences not yet reflected on" is
+outcome-paired only (INNER JOIN outcomes), and any outcome status counts — resolved, failed,
+and partial all constitute evidence, not just resolved. A failed or partial outcome still
+teaches something durable ("action X does not resolve Y"), which fits PROJECT.md's
+confidence-weighted-knowledge framing; gating on status='resolved' would silently discard that
+signal. This is unexercised by today's seed data (domains/incident-response's seed script
+hardcodes every outcome to 'resolved', per the 2026-08-16 entry on that) but is the more
+correct general design, chosen deliberately over the narrower "resolved only" default.
+
+2026-08-18 — reflect.ts groups experiences by domain partition + generic token/word-overlap
+similarity (Jaccard similarity over a stopword-filtered token set), not by embedding cosine
+similarity, even though embeddings would be the more principled general-purpose similarity
+measure. This is a deliberate dev-velocity tradeoff, not a claim that heuristic grouping is
+better: Voyage's free tier (3 RPM, see the 2026-08-16 entry on embedText's retry stance) already
+caused a real delay during this feature's own integration testing, and embedding-based grouping
+would re-embed the entire seed set on every local reflect.ts test run across what was expected
+to be (and was) many iterations while building this file. Knowledge itself still gets a real
+Voyage embedding via createKnowledge, and each group's nearby-knowledge lookup still costs one
+real embedding call — only the experience-to-experience grouping step avoids embeddings. Revisit
+once a paid Voyage tier removes the rate-limit concern; the natural upgrade is switching
+groupExperiences to embed each experience and cluster by cosine similarity, reusing embedText
+the same way knowledge.ts and retrieve.ts already do.
+
+2026-08-18 — reflect.ts checkpoints an apply attempt (agent_state.payload.groups[i].applyAttempt)
+around the one non-idempotent write per group (createKnowledge or reinforceKnowledge),
+in addition to the per-group checkpoint the task called for, because a group's apply step is
+itself two sequential writes and a crash between the first landing and the group being marked
+complete would otherwise re-issue it on resume — a true duplicate row for createKnowledge, or
+the same double-increment gap already documented for reinforceKnowledge's bare retry case
+(2026-08-17 entry). For createKnowledge, the checkpoint records the new row's id the instant it
+returns, before evidence-linking starts; a resume with that id already present reuses it instead
+of calling createKnowledge again. For reinforceKnowledge, the checkpoint records a
+confidence/reinforcement_count snapshot read just before the call; a resume re-reads the current
+row and only re-calls reinforceKnowledge if the row still matches that snapshot (the same
+read-a-prior-snapshot-and-compare idiom decayKnowledgeConfidence already uses, applied here at
+the application layer since reinforceKnowledge itself has no built-in optimistic-concurrency
+guard). Reuse is gated on the checkpointed applyAttempt.action matching the freshly-fetched
+proposal's action specifically — a resumed run re-asks Claude rather than replaying the original
+proposal, and sampling means the retry isn't guaranteed to return the same action; reusing a
+stale create's knowledgeId for a proposal that now says reinforce would link evidence to the
+wrong row while never applying the real proposal. Found and fixed while writing reflect.test.ts's
+resume-path tests, before this ever ran against a real crash. Residual, deliberately accepted gap:
+if the client loses the acknowledgment after the write already committed (not merely fails before
+committing), the snapshot comparison correctly detects "already applied" for reinforceKnowledge,
+but createKnowledge has no natural dedupe key to detect the same situation after the fact — closing
+that fully needs an idempotency key on knowledge inserts, which is a schema change out of scope
+here and left as a known gap, the same way reinforceKnowledge's own bare-retry gap already is.
+
+2026-08-18 — reflect.ts's applyAttempt checkpoint gained a third field, auditRecorded, after
+production-reviewer found that the "applied" path's recordAuditEntry call had no dedup guard of
+its own: a crash between that INSERT committing and the group being marked "completed" would
+resume into a fresh recordAuditEntry call, writing a second "reflection.proposal_applied" entry
+for a proposal that was, at most, actually applied once (the underlying createKnowledge/
+reinforceKnowledge write was already correctly deduped by applyAttempt's other fields — only the
+audit trail itself was exposed). Since agent_audit_log is explicitly the durable record of what
+was applied, not just an operational log line, a phantom duplicate there actively misrepresents
+history rather than merely cluttering it. Fixed the same way as every other sub-checkpointed
+write in this file: recordAuditEntry is skipped if applyAttempt.auditRecorded is already true,
+and a checkpoint immediately follows a successful call to set it, before the final
+group-completed checkpoint. Covered by a dedicated resume test in reflect.test.ts. Residual gap,
+deliberately accepted and now stated explicitly in-code: this narrows the risk window to
+"between recordAuditEntry committing and its own checkpoint landing" but doesn't fully close it —
+agent_audit_log has no natural dedupe key (unlike knowledge_evidence's ON CONFLICT DO NOTHING),
+so a crash in that exact narrower window can still produce one duplicate row. Same class of gap
+as createKnowledge's lost-acknowledgment case above; closing it fully would need real dedupe
+columns (e.g. run_id + group_index) with a unique constraint on agent_audit_log, a schema change
+out of scope here.
+
+2026-08-18 — reflect.ts's ReflectionGroupState checkpoint gained a `proposal` field (moved from
+being computed fresh every call to being cached the instant it's validated), after code-reviewer
+found a more serious version of the resume-replay problem than the auditRecorded gap above: since
+processGroup re-asked Claude for a fresh proposal on every resume rather than persisting the one
+already validated, and Claude's sampling isn't pinned to temperature 0, a resumed group's fresh
+sample was never guaranteed to return the same action as one that might already be partially or
+fully applied. Concretely: if a crash landed after createKnowledge/reinforceKnowledge committed
+(applyAttempt.knowledgeId or .reinforceSnapshot already checkpointed) but before the group was
+marked "completed", a resumed sample returning a different action would silently orphan the
+already-committed write — worse, a resumed sample returning "skip" would cause the group to be
+recorded as "reflection.proposal_skipped" even though a real write had already landed, which is
+exactly the kind of misrepresentation CLAUDE.md rule 4's "logs both the proposal and what was
+actually applied" is meant to prevent. Fixed by checkpointing the validated ReflectionProposal
+itself the moment validation succeeds, before anything is applied from it; a resumed group with
+an already-cached proposal replays it exactly and never calls Claude again for that group. The
+ReflectionProposal interface moved from reflect.ts into agentState.ts as part of this, since it's
+now genuinely part of the persisted checkpoint schema, not solely reflect.ts's own working data —
+reflect.ts imports the type from there instead of defining it locally. This also fully subsumes
+the narrower "stale applyAttempt.action mismatch" guard added earlier in applyProposal: under the
+current code that guard is unreachable in normal operation (proposal is always cached before
+applyAttempt can be set), but it's kept as defense-in-depth rather than removed, since it's a
+correct, cheap safety net against any future code path that doesn't go through the caching
+discipline. Covered by two dedicated resume tests in reflect.test.ts, including one that
+reproduces the exact orphan/false-skip scenario code-reviewer described and asserts Claude is
+never called and the group is correctly completed, not skipped.
+
+2026-08-18 — Two lower-severity gaps production-reviewer found in reflect.ts/agentState.ts are
+recorded here as deliberately deferred rather than fixed in this pass, since both require a
+schema migration and CLAUDE.md's working-style rule requires Plan mode (and, in practice here,
+explicit sign-off) for anything touching the schema — not something to do as a drive-by inside
+an already-large feature the day before a demo:
+(1) claimReflectionRun has no unique constraint backing it, unlike resumeReflectionRun's
+compare-and-swap — two invocations that both see no active run (e.g. two overlapping Lambda
+retries for the same org, the same at-least-once-semantics scenario the CAS guard was built for)
+could each INSERT their own fresh 'running' row and process overlapping work. Closing this needs
+a partial unique index, e.g. CREATE UNIQUE INDEX ON agent_state (org_id, step) WHERE status =
+'running'. (2) reflect.ts introduces the first genuinely repeated, index-shaped query pattern
+against experiences (a (created_at, id) keyset-paginated scan) and against agent_state (find the
+latest non-completed row per org+step), and neither table has a supporting index for it yet —
+harmless at demo scale, but worth a migration adding (org_id, created_at, id) on experiences and
+(org_id, step, status) on agent_state before this runs against real accumulated volume.
+
 2026-08-18 — agent/loop.ts's citation format was genuinely ambiguous: the prompt labels each
 retrieved item in brackets as `[experience:<id>]`/`[knowledge:<id>]` and says to "cite those
 ids exactly as given," without saying whether "the id" means the bare id after the colon (what
