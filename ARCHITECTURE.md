@@ -197,35 +197,51 @@ await auditLog.record({ action: 'reflection.proposal_applied', detail: { proposa
   engine owns its own persistence layer, migrations included, consistent with the repo tree.
 
 ## System diagram
+
+Reflects what's actually built and deployed — no S3 for now (postmortems are ingested from a local
+seed file, not object storage; see `domains/incident-response/ingest/`), and both `apps/api`
+and `apps/worker` call `packages/engine` directly, in-process, not over a network hop. That's
+why CockroachDB, Anthropic, and Voyage all hang off `packages/engine` itself rather than off
+either app individually — the engine is the one place that actually makes those outbound calls.
+
 ```
-              ┌───────────────────────┐
-              │  Next.js Dashboard     │
-              └───────────┬────────────┘
-                          │ REST
-              ┌───────────▼────────────┐
-              │      Fastify API       │  uses packages/engine + domains/incident-response
-              └───────────┬────────────┘
-                          │ SQL + VECTOR
-              ┌───────────▼────────────┐
-              │      CockroachDB       │◄── Managed MCP Server (dev-time schema
-              │ experiences            │    inspection + optional runtime query)
-              │ knowledge (VECTOR)     │
-              │ knowledge_evidence     │
-              │ agent_state, outcomes  │
-              │ agent_audit_log        │
-              └───────────┬────────────┘
-                          │
-               ┌──────────┴───────────┐
-               │                      │
-    ┌──────────▼─────────┐  ┌─────────▼──────────┐
-    │  AWS Lambda          │  │   Amazon S3         │
-    │  reflection job       │  │  raw postmortems    │
-    └──────────┬────────────┘  └────────────────────┘
-               │
-    ┌──────────▼──────────┐
-    │  Anthropic API        │
-    │  (Claude)              │
-    └────────────────────────┘
+                ┌────────────────────────┐
+                │  apps/web (Next.js)    │
+                │  incidents, knowledge  │
+                └───────────┬────────────┘
+                            │ REST (fetch)
+                ┌───────────▼────────────┐        ┌────────────────────────────┐
+                │  apps/api (Fastify)    │        │  apps/worker               │
+                │  HTTP routes           │        │  AWS Lambda (scheduled)    │
+                └───────────┬────────────┘        └──────────────┬─────────────┘
+                            │                                    │
+                            │   both call packages/engine        │
+                            │   directly, in-process — no        │
+                            │   network hop between them         │
+                            └───────────────────┬────────────────┘
+                                                 │
+                                 ┌───────────────▼─────────────────┐
+                                 │  packages/engine                │
+                                 │  domain-agnostic core           │
+                                 │  + domains/incident-response    │
+                                 └──────┬──────────────┬─────────┬─┘
+                                        │              │         │
+                             SQL+VECTOR │        HTTPS │   HTTPS │
+                                        │              │         │
+                   ┌────────────────────▼───┐  ┌────────▼───────┐ ┌▼─────────────────┐
+                   │  CockroachDB           │  │  Anthropic API │ │  Voyage AI       │
+                   │  experiences           │  │  (Claude) —    │ │  embeddings      │
+                   │  knowledge (VECTOR)    │  │  agent         │ │  (voyage-3.5,    │
+                   │  knowledge_evidence    │  │  reasoning +   │ │   1024-dim)      │
+                   │  agent_state, outcomes │  │  reflection    │ └──────────────────┘
+                   │  agent_audit_log       │  └────────────────┘
+                   └───────────┬────────────┘
+                               │ dev-time schema inspection
+                               │ (not on the runtime path)
+                   ┌───────────▼────────────┐
+                   │  CockroachDB Managed   │
+                   │  MCP Server            │
+                   └────────────────────────┘
 ```
 
 ## API endpoints (MVP)
